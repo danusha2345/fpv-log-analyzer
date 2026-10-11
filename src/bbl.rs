@@ -391,14 +391,14 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
     let n = names.len();
     for (d, kind) in [(&def_i, 'I'), (&def_p, 'P')] {
         if d.encoding.len() != n || d.predictor.len() != n || d.signed.len() != n {
-            return Err(format!("описание кадра {kind} не совпадает с числом полей ({n})"));
+            return Err(format!("заголовок лога повреждён: описание кадра {kind} не совпадает с числом полей ({n})"));
         }
     }
-    for (d, kind) in [(&def_s, 'S'), (&def_g, 'G'), (&def_h, 'H')] {
-        if d.encoding.len() != d.predictor.len() || d.signed.len() < d.encoding.len() {
-            return Err(format!("описание кадра {kind} повреждено"));
-        }
-    }
+    // Служебные кадры (S, G, H) анализу не нужны — их достаточно уметь пропускать.
+    // Если описание такого кадра в заголовке повреждено, кадр считается нечитаемым:
+    // разбор пересинхронизируется на следующем, а основной поток данных сохраняется.
+    let usable = |d: &FrameDef| d.encoding.len() == d.predictor.len() && d.signed.len() >= d.encoding.len();
+    let (s_ok, g_ok, h_ok) = (usable(&def_s), usable(&def_g), usable(&def_h));
     let time_idx = names.iter().position(|s| s == "time").ok_or("нет поля time")?;
     // Раскладка битов режимов полёта сверена с исходниками только для Betaflight 2026.x.
     let modern = get("Firmware revision").is_some_and(|f| f.starts_with("Betaflight 2026."));
@@ -446,17 +446,16 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
                 parse_frame(&mut r, &def_p, &ctx, &mut cur, Some((&prev, &prev2)), skipped);
                 true
             }
-            b'S' => {
-                parse_frame(&mut r, &def_s, &ctx, &mut scratch, None, 0);
-                true
-            }
-            b'G' => {
-                parse_frame(&mut r, &def_g, &ctx, &mut scratch, None, 0);
-                true
-            }
-            b'H' => {
-                parse_frame(&mut r, &def_h, &ctx, &mut scratch, None, 0);
-                true
+            b'S' | b'G' | b'H' => {
+                let (def, usable) = match kind {
+                    b'S' => (&def_s, s_ok),
+                    b'G' => (&def_g, g_ok),
+                    _ => (&def_h, h_ok),
+                };
+                if usable {
+                    parse_frame(&mut r, def, &ctx, &mut scratch, None, 0);
+                }
+                usable
             }
             b'E' => {
                 event = parse_event(&mut r, modern);

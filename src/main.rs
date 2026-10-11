@@ -1022,6 +1022,49 @@ mod ui_tests {
         assert!(harness.query_by_label("Весь лог").is_none());
     }
 
+    /// Каждая вкладка на каждом образце лога из `~/storage/fpv-log-samples`:
+    /// разные прошивки и наборы полей не должны ронять интерфейс.
+    /// Долгий, запускается отдельно: `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn every_tab_on_every_sample_log() {
+        fn logs_in(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                if path.is_dir() {
+                    logs_in(&path, out);
+                } else if ["bbl", "bfl", "txt"].contains(&ext.as_str()) {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        logs_in(Path::new(&(std::env::var("HOME").unwrap() + "/storage/fpv-log-samples")), &mut paths);
+        paths.sort();
+        let mut opened = 0;
+        for path in &paths {
+            let mut app = App::new();
+            app.open(path);
+            if app.logs.is_empty() {
+                continue;
+            }
+            opened += 1;
+            let records = app.logs.len();
+            let mut harness = Harness::builder().with_size([1400.0, 900.0]).build_ui_state(|ui, app: &mut App| app.draw(ui), app);
+            for record in 0..records.min(3) {
+                harness.state_mut().current = record;
+                for (tab, ..) in TABS {
+                    harness.state_mut().tab = tab;
+                    harness.state_mut().view.by_rpm = record % 2 == 0;
+                    harness.state_mut().view.trial_on = true;
+                    harness.run_steps(3);
+                }
+            }
+        }
+        eprintln!("открыто логов: {opened} из {}", paths.len());
+    }
+
     #[test]
     fn map_readout_reports_cell_level() {
         let grid = dsp::Grid { w: 2, h: 3, db: vec![1.0, 2.0, 3.0, f32::NAN, 5.0, 6.0] };

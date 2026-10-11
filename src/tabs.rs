@@ -335,6 +335,12 @@ fn findings(loaded: &mut Loaded) -> Vec<(bool, String)> {
         let Some(step) = step else { continue };
         let peak = step.points.iter().map(|p| p[1]).fold(0.0, f64::max);
         let half = step.points.iter().find(|p| p[1] >= 0.5).map_or(f64::NAN, |p| p[0]);
+        if peak > 3.0 {
+            // Втрое выше задания контур не отвечает: значит, гироскоп на этом участке
+            // с заданием почти не связан (ручной режим, самолёт, срыв) и оценка не годится.
+            out.push((false, format!("{}: отклик на ступеньку получился неправдоподобным (пик {peak:.1}) — на этом участке гироскоп плохо следует заданию, оценке отклика доверять нельзя.", AXES[a])));
+            continue;
+        }
         if peak > 1.2 {
             out.push((true, format!("{}: перерегулирование {:.0} % в отклике на ступеньку.", AXES[a], (peak - 1.0) * 100.0)));
         }
