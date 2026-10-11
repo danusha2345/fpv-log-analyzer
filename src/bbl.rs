@@ -58,6 +58,9 @@ struct FrameDef {
     signed: Vec<bool>,
     predictor: Vec<u8>,
     encoding: Vec<u8>,
+    /// Номер поля, перед которым в кадре записано значение, не описанное в заголовке
+    /// (см. [`parse_log`]); оно читается и отбрасывается.
+    undeclared_before: Option<usize>,
 }
 
 #[derive(Default)]
@@ -228,6 +231,9 @@ fn parse_frame(
     let n = def.encoding.len();
     let mut i = 0;
     while i < n {
+        if def.undeclared_before == Some(i) {
+            r.unsigned_vb();
+        }
         if def.predictor[i] == 6 {
             cur[i] = skipped + 1 + prev.map_or(0, |(p, _)| p[i]);
             i += 1;
@@ -390,6 +396,25 @@ fn parse_list<T: std::str::FromStr>(value: &str) -> Vec<T> {
 }
 
 fn parse_log(data: &[u8]) -> Result<Log, String> {
+    let log = parse_log_as(data, false)?;
+    // Ошибка INAV 8: у аппарата без моторов в опорный кадр всё равно пишется значение
+    // первого мотора, хотя поля моторов в заголовке не объявлены (blackbox.c: запись
+    // идёт по условию «моторы включены», объявление — по их числу). Кадр получается
+    // длиннее описанного, и запись выглядит сплошь повреждённой. Если разбор с учётом
+    // лишнего значения даёт больше кадров — берём его.
+    let inav_without_motors = log.header("Firmware revision").is_some_and(|f| f.starts_with("INAV")) && log.col("motor[0]").is_none();
+    if inav_without_motors && log.corrupt > 0 {
+        let fixed = parse_log_as(data, true)?;
+        if fixed.time.len() > log.time.len() {
+            return Ok(fixed);
+        }
+    }
+    Ok(log)
+}
+
+/// Разбор одной записи. `phantom_motor` — считать, что в опорных кадрах перед
+/// сервами (или перед `navState`) есть необъявленное значение мотора.
+fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
     let mut headers = Vec::new();
     let mut pos = 0;
     while data[pos..].starts_with(b"H ") {
@@ -408,10 +433,14 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
             signed: parse_list::<u8>(field(names_from, "signed")).iter().map(|&s| s != 0).collect(),
             predictor: parse_list(field(kind, "predictor")),
             encoding: parse_list(field(kind, "encoding")),
+            undeclared_before: None,
         }
     };
     let names: Vec<String> = get("Field I name").ok_or("нет заголовка Field I name")?.split(',').map(str::to_string).collect();
-    let (def_i, def_p) = (def('I', 'I'), def('P', 'I'));
+    let (mut def_i, def_p) = (def('I', 'I'), def('P', 'I'));
+    if phantom_motor {
+        def_i.undeclared_before = names.iter().position(|n| n == "servo[0]").or_else(|| names.iter().position(|n| n == "navState"));
+    }
     let (def_s, def_g, def_h) = (def('S', 'S'), def('G', 'G'), def('H', 'H'));
     let n = names.len();
     for (d, kind) in [(&def_i, 'I'), (&def_p, 'P')] {
@@ -539,6 +568,16 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Лог INAV 8 с аппарата без моторов (ошибка прошивки: в опорных кадрах лишнее значение).
+    /// Без поправки из него читалось 7 656 кадров с 16 тысячами разрывов.
+    #[test]
+    fn inav_log_without_motors_is_readable() {
+        let path = std::env::var("HOME").unwrap() + "/storage/fpv-log-samples/issues/iNavFlight_blackbox-log-viewer_118/LOG00011.TXT";
+        let Ok(data) = std::fs::read(path) else { return };
+        let log = super::parse_file(&data).remove(0).unwrap();
+        assert!(log.time.len() > 250_000 && log.corrupt < 10, "кадров {}, разрывов {}", log.time.len(), log.corrupt);
+    }
+
     #[test]
     fn flight_mode_names_follow_firmware_version() {
         use super::{mode_names, modes_of};

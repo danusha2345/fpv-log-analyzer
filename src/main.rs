@@ -866,6 +866,15 @@ impl App {
     }
 }
 
+/// Печатает строку на стандартный вывод. Если читатель закрыл поток (`| head`),
+/// программа спокойно завершается, а не падает с ошибкой записи.
+fn say(text: std::fmt::Arguments) {
+    use std::io::Write;
+    if writeln!(std::io::stdout(), "{text}").is_err() {
+        std::process::exit(0);
+    }
+}
+
 /// Печатает запись в CSV: время от начала в микросекундах и все поля как в логе.
 fn write_csv(log: &bbl::Log) {
     use std::io::Write;
@@ -915,12 +924,12 @@ fn main() -> eframe::Result {
     }
     if mode.as_deref() == Some("report") {
         for (i, loaded) in app.logs.iter_mut().enumerate() {
-            println!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", i + 1, loaded.log.time.last().unwrap_or(&0.0), loaded.sample_rate, loaded.log.time.len(), loaded.log.corrupt);
+            say(format_args!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", i + 1, loaded.log.time.last().unwrap_or(&0.0), loaded.sample_rate, loaded.log.time.len(), loaded.log.corrupt));
             for (important, text) in &tabs::overview(loaded).findings {
-                println!("  [{}] {text}", if *important { "важно" } else { "заметка" });
+                say(format_args!("  [{}] {text}", if *important { "важно" } else { "заметка" }));
             }
             for (time, event) in &loaded.log.events {
-                println!("  [событие] {time:.2} с: {event}");
+                say(format_args!("  [событие] {time:.2} с: {event}"));
             }
         }
         if let Some(e) = &app.error {
