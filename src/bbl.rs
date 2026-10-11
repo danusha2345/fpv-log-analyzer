@@ -365,14 +365,45 @@ const MODES_2026: Modes = [
     "LEDLOW", "CALIB", "OSD", "TELEMETRY", "SERVO1", "SERVO2", "SERVO3", "BLACKBOX", "AIRMODE", "3D", "FPVANGLEMIX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "CRASHFLIP",
 ];
 
-/// Раскладка для прошивки, если она известна (сверено с исходниками версий
-/// 4.2.11, 4.3.2, 4.4.3, 4.5.2, 2025.12.2 и 2026.x).
+const MODES_INAV_7: Modes = [
+    "ARM", "ANGLE", "HORIZON", "NAVALTHOLD", "HEADINGHOLD", "HEADFREE", "HEADADJ", "CAMSTAB", "NAVRTH", "NAVPOSHOLD", "MANUAL", "BEEPERON", "LEDLOW", "LIGHTS", "NAVLAUNCH", "OSD",
+    "TELEMETRY", "BLACKBOX", "FAILSAFE", "NAVWP", "AIRMODE", "HOMERESET", "GCSNAV", "KILLSWITCH", "SURFACE", "FLAPERON", "TURNASSIST", "AUTOTRIM", "AUTOTUNE", "CAMERA1", "CAMERA2", "CAMERA3",
+];
+const MODES_INAV_8: Modes = [
+    "ARM", "ANGLE", "HORIZON", "NAVALTHOLD", "HEADINGHOLD", "HEADFREE", "HEADADJ", "CAMSTAB", "NAVRTH", "NAVPOSHOLD", "MANUAL", "BEEPERON", "LEDLOW", "LIGHTS", "NAVLAUNCH", "OSD",
+    "TELEMETRY", "BLACKBOX", "FAILSAFE", "NAVWP", "AIRMODE", "HOMERESET", "GCSNAV", "SURFACE", "FLAPERON", "TURNASSIST", "AUTOTRIM", "AUTOTUNE", "CAMERA1", "CAMERA2", "CAMERA3", "OSDALT1",
+];
+const MODES_EMUFLIGHT_04: Modes = [
+    "ARM", "ANGLE", "HORIZON", "MAG", "BARO", "GPSHOME", "GPSHOLD", "HEADFREE", "PASSTHRU", "FAILSAFE", "GPSRESCUE", "NFEMODE", "HEADADJ", "CAMSTAB", "BEEPERON", "LEDLOW",
+    "CALIB", "OSD", "TELEMETRY", "SERVO1", "SERVO2", "SERVO3", "BLACKBOX", "AIRMODE", "3D", "FPVANGLEMIX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "FLIPOVERAFTERCRASH", "PREARM",
+];
+/// В Rotorflight 4.3 режимов меньше 32 — у лишних битов названия нет.
+const MODES_ROTORFLIGHT_43: Modes = [
+    "ARM", "ANGLE", "HORIZON", "TRAINER", "ALTHOLD", "RESCUE", "GPSRESCUE", "FAILSAFE", "PREARM", "PARALYZE", "BEEPERON", "BEEPERMUTE", "LEDLOW", "CALIB", "OSD", "TELEMETRY",
+    "BEEPGPSCOUNT", "BLACKBOX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "VTXPITMODE", "VTXCONTROLDISABLE", "STICKCOMMANDDISABLE", "USER1", "USER2", "USER3", "USER4", "", "", "",
+];
+const MODES_ROTORFLIGHT_46: Modes = [
+    "ARM", "ANGLE", "HORIZON", "TRAINER", "ALTHOLD", "RESCUE", "GPSRESCUE", "FAILSAFE", "PREARM", "PARALYZE", "BEEPERON", "BEEPERMUTE", "LEDLOW", "CALIB", "OSD", "TELEMETRY",
+    "BEEPGPSCOUNT", "BLACKBOX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "VTXPITMODE", "VTXCONTROLDISABLE", "STICKCOMMANDDISABLE", "GOVFALLBACK", "GOVSUSPEND", "GOVBYPASS", "USER1", "USER2", "USER3", "USER4",
+];
+
+/// Раскладка для прошивки, если она известна. Сверено с исходниками версий:
+/// Betaflight 4.2.11, 4.3.2, 4.4.3, 4.5.2, 2025.12.2, master (2026.x);
+/// INAV 2.1.0, 3.0.1, 7.1.2 (одинаковы), 8.0.1, 9.0.1 (одинаковы);
+/// EmuFlight 0.4.1, 0.4.3; Rotorflight 4.3.0, 4.6.0.
 fn modes_of(firmware: &str) -> Option<&'static Modes> {
-    let version = firmware.strip_prefix("Betaflight ")?;
-    match version {
-        v if ["4.2.", "4.3.", "4.4.", "4.5."].iter().any(|p| v.starts_with(p)) => Some(&MODES_4),
-        v if v.starts_with("2025.12") => Some(&MODES_2025),
-        v if v.starts_with("2026.") => Some(&MODES_2026),
+    let (name, version) = firmware.split_once(' ')?;
+    let major: u32 = version.split('.').next()?.parse().ok()?;
+    let is = |prefixes: &[&str]| prefixes.iter().any(|p| version.starts_with(p));
+    match name {
+        "Betaflight" if is(&["4.2.", "4.3.", "4.4.", "4.5."]) => Some(&MODES_4),
+        "Betaflight" if is(&["2025.12"]) => Some(&MODES_2025),
+        "Betaflight" if is(&["2026."]) => Some(&MODES_2026),
+        "INAV" if (2..=7).contains(&major) => Some(&MODES_INAV_7),
+        "INAV" if (8..=9).contains(&major) => Some(&MODES_INAV_8),
+        "EmuFlight" if is(&["0.4."]) => Some(&MODES_EMUFLIGHT_04),
+        "Rotorflight" if is(&["4.3."]) => Some(&MODES_ROTORFLIGHT_43),
+        "Rotorflight" if is(&["4.6."]) => Some(&MODES_ROTORFLIGHT_46),
         _ => None,
     }
 }
@@ -383,9 +414,9 @@ fn mode_names(mask: u32, modes: Option<&Modes>) -> String {
     let names: Vec<String> = (0..32usize)
         .filter(|bit| mask >> bit & 1 != 0)
         .map(|bit| match modes {
-            Some(modes) => modes[bit].to_string(),
+            Some(modes) if !modes[bit].is_empty() => modes[bit].to_string(),
             None if bit < 3 => MODES_4[bit].to_string(),
-            None => format!("бит {bit}"),
+            _ => format!("бит {bit}"),
         })
         .collect();
     if names.is_empty() { "нет".into() } else { names.join(", ") }
@@ -585,8 +616,13 @@ mod tests {
         assert_eq!(mode_names(1 | 1 << 20, modes_of("Betaflight 4.5.0 (5cdae1b0c) STM32F7X2")), "ARM, AIRMODE");
         assert_eq!(mode_names(1 | 1 << 23, modes_of("Betaflight 2025.12.2 (79065c96b) AT32F435M")), "ARM, AIRMODE");
         assert_eq!(mode_names(1 | 1 << 24, modes_of("Betaflight 2026.6.0-alpha (c40f1e096) STM32G47X")), "ARM, AIRMODE");
+        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 9.0.1 (d44f2cf6) DAKEFPVF722")), "ARM, ANGLE, NAVPOSHOLD");
+        assert_eq!(mode_names(1 << 23, modes_of("INAV 7.1.2 (4e1e59eb) MATEKF405")), "KILLSWITCH");
+        assert_eq!(mode_names(1 << 23, modes_of("INAV 8.0.1 (ae47bcba) OMNIBUSF4V3")), "SURFACE");
+        assert_eq!(mode_names(1 | 1 << 30, modes_of("Rotorflight 4.3.0-RC1 (19d3380) STM32G47")), "ARM, бит 30");
         // Для неизвестной раскладки названы только общие первые три бита.
-        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 9.0.1 (d44f2cf6) DAKEFPVF722")), "ARM, ANGLE, бит 9");
+        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 10.0.0 (abcdef) X")), "ARM, ANGLE, бит 9");
+        assert_eq!(mode_names(1 << 5, modes_of("EmuFlight 3.7.0 (1014a9331) KAKUTEF7V15")), "бит 5");
         assert_eq!(mode_names(0, None), "нет");
     }
 

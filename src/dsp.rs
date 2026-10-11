@@ -73,12 +73,27 @@ fn map_window(len: usize, fs: f64) -> Option<(usize, usize)> {
     (len >= n && fs > 0.0).then(|| (n, (n / 4).max((len - n) / 4096 + 1)))
 }
 
-/// Спектрограмма: по `x` — время (столбцы равномерно покрывают весь сигнал), по `y` — частота.
-pub fn spectrogram(x: &[f32], fs: f64) -> Option<Grid> {
+/// Спектрограмма: по `x` — время от начала до конца записи равномерно, по `y` — частота.
+/// `time` — время каждого отсчёта: там, где в записи разрыв, столбцы остаются пустыми,
+/// а не сдвигают всё последующее влево.
+pub fn spectrogram(x: &[f32], time: &[f64], fs: f64) -> Option<Grid> {
     let (n, hop) = map_window(x.len(), fs)?;
     let h = n / 2 + 1;
-    let db: Vec<f32> = stft(x, fs, n, hop).into_iter().map(to_db).collect();
-    Some(Grid { w: db.len() / h, h, db })
+    let frames: Vec<f32> = stft(x, fs, n, hop).into_iter().map(to_db).collect();
+    let centers: Vec<f64> = (0..frames.len() / h).map(|k| time[k * hop + n / 2]).collect();
+    let (start, end) = (time[0], time[time.len() - 1]);
+    let w = centers.len();
+    let mut db = vec![f32::NAN; w * h];
+    for col in 0..w {
+        let t = start + (end - start) * (col as f64 + 0.5) / w as f64;
+        let after = centers.partition_point(|&c| c < t);
+        let nearest = [after.saturating_sub(1), after.min(w - 1)].into_iter().min_by(|&a, &b| (centers[a] - t).abs().total_cmp(&(centers[b] - t).abs())).unwrap();
+        // Момент покрыт, если попадает в окно ближайшего кадра.
+        if (centers[nearest] - t).abs() <= n as f64 / fs / 2.0 {
+            db[col * h..(col + 1) * h].copy_from_slice(&frames[nearest * h..(nearest + 1) * h]);
+        }
+    }
+    Some(Grid { w, h, db })
 }
 
 /// Шум в зависимости от режима (газа или оборотов): по `x` — режим в процентах
@@ -350,9 +365,18 @@ mod tests {
     fn spectrogram_follows_frequency_change() {
         let mut x = sine(100.0, 5000);
         x.extend(sine(300.0, 5000));
-        let g = spectrogram(&x, FS).unwrap();
+        let uniform: Vec<f64> = (0..x.len()).map(|i| i as f64 / FS).collect();
+        let g = spectrogram(&x, &uniform, FS).unwrap();
         assert!((peak_hz(&g, g.w / 4) - 100.0).abs() < 5.0);
         assert!((peak_hz(&g, 3 * g.w / 4) - 300.0).abs() < 5.0);
+
+        // Разрыв записи на 10 с посередине: 5 с данных, 10 с пусто, 5 с данных.
+        let gapped: Vec<f64> = (0..x.len()).map(|i| i as f64 / FS + if i < 5000 { 0.0 } else { 10.0 }).collect();
+        let g = spectrogram(&x, &gapped, FS).unwrap();
+        let at = |seconds: f64| (seconds / 20.0 * g.w as f64) as usize;
+        assert!((peak_hz(&g, at(2.0)) - 100.0).abs() < 5.0);
+        assert!(g.db[at(10.0) * g.h].is_nan(), "в разрыве записи данных нет");
+        assert!((peak_hz(&g, at(18.0)) - 300.0).abs() < 5.0);
     }
 
     #[test]

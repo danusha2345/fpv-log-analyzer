@@ -275,7 +275,7 @@ impl Loaded {
             };
             let sets = [
                 set(binned(&throttle), 100.0),
-                set(cols.iter().map(|c| dsp::spectrogram((*c)?, fs)).collect(), *self.log.time.last().unwrap()),
+                set(cols.iter().map(|c| dsp::spectrogram((*c)?, &self.log.time, fs)).collect(), *self.log.time.last().unwrap()),
                 set(binned(&rpm_pct), rpm_max as f64),
             ];
             self.maps = Some(Maps { signal, range_db: f32::NAN, sets });
