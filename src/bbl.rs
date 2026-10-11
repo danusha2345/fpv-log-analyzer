@@ -306,7 +306,7 @@ fn parse_frame(
 
 /// Разбирает событие и возвращает его описание; `None` — событие не распознано.
 /// Описание [`END_OF_LOG`] означает конец записи.
-fn parse_event(r: &mut Reader, modern: bool) -> Option<String> {
+fn parse_event(r: &mut Reader, modes: Option<&Modes>) -> Option<String> {
     Some(match r.byte() {
         0 => {
             r.unsigned_vb();
@@ -328,7 +328,7 @@ fn parse_event(r: &mut Reader, modern: bool) -> Option<String> {
         15 => format!("Дизарм, причина {}", r.unsigned_vb()),
         30 => {
             let (now, before) = (r.unsigned_vb(), r.unsigned_vb());
-            format!("Режимы полёта: {} → {}", mode_names(before, modern), mode_names(now, modern))
+            format!("Режимы полёта: {} → {}", mode_names(before, modes), mode_names(now, modes))
         }
         255 => {
             const END: &[u8] = b"End of log\0";
@@ -343,19 +343,44 @@ fn parse_event(r: &mut Reader, modern: bool) -> Option<String> {
 
 const END_OF_LOG: &str = "Конец записи";
 
-/// Раскладка битов режимов в Betaflight 2026.x (порядок `boxId` в `rc_modes.h`).
-const MODES_2026: [&str; 32] = [
+/// Раскладки битов режимов полёта — порядок `boxId` в `src/main/fc/rc_modes.h`
+/// соответствующих версий Betaflight.
+type Modes = [&'static str; 32];
+const MODES_4: Modes = [
+    "ARM", "ANGLE", "HORIZON", "MAG", "HEADFREE", "PASSTHRU", "FAILSAFE", "GPSRESCUE", "ANTIGRAVITY", "HEADADJ", "CAMSTAB", "BEEPERON", "LEDLOW", "CALIB", "OSD", "TELEMETRY",
+    "SERVO1", "SERVO2", "SERVO3", "BLACKBOX", "AIRMODE", "3D", "FPVANGLEMIX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "FLIPOVERAFTERCRASH", "PREARM", "BEEPGPSCOUNT", "VTXPITMODE", "PARALYZE",
+];
+const MODES_2025: Modes = [
+    "ARM", "ANGLE", "HORIZON", "MAG", "ALTHOLD", "HEADFREE", "CHIRP", "PASSTHRU", "FAILSAFE", "POSHOLD", "GPSRESCUE", "ANTIGRAVITY", "HEADADJ", "CAMSTAB", "BEEPERON", "LEDLOW",
+    "CALIB", "OSD", "TELEMETRY", "SERVO1", "SERVO2", "SERVO3", "BLACKBOX", "AIRMODE", "3D", "FPVANGLEMIX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "CRASHFLIP", "PREARM",
+];
+const MODES_2026: Modes = [
     "ARM", "ANGLE", "HORIZON", "MAG", "ALTHOLD", "HEADFREE", "CHIRP", "PASSTHRU", "FAILSAFE", "POSHOLD", "GPSRESCUE", "AUTOPILOT", "ANTIGRAVITY", "HEADADJ", "CAMSTAB", "BEEPERON",
     "LEDLOW", "CALIB", "OSD", "TELEMETRY", "SERVO1", "SERVO2", "SERVO3", "BLACKBOX", "AIRMODE", "3D", "FPVANGLEMIX", "BLACKBOXERASE", "CAMERA1", "CAMERA2", "CAMERA3", "CRASHFLIP",
 ];
 
+/// Раскладка для прошивки, если она известна (сверено с исходниками версий
+/// 4.2.11, 4.3.2, 4.4.3, 4.5.2, 2025.12.2 и 2026.x).
+fn modes_of(firmware: &str) -> Option<&'static Modes> {
+    let version = firmware.strip_prefix("Betaflight ")?;
+    match version {
+        v if ["4.2.", "4.3.", "4.4.", "4.5."].iter().any(|p| v.starts_with(p)) => Some(&MODES_4),
+        v if v.starts_with("2025.12") => Some(&MODES_2025),
+        v if v.starts_with("2026.") => Some(&MODES_2026),
+        _ => None,
+    }
+}
+
 /// Включённые режимы полёта по битовой маске. Первые три бита одинаковы во всех
-/// прошивках; остальные названы только там, где раскладка известна (`modern`),
-/// иначе показан номер бита.
-fn mode_names(mask: u32, modern: bool) -> String {
+/// прошивках; остальные названы только там, где раскладка известна, иначе показан номер бита.
+fn mode_names(mask: u32, modes: Option<&Modes>) -> String {
     let names: Vec<String> = (0..32usize)
         .filter(|bit| mask >> bit & 1 != 0)
-        .map(|bit| if modern || bit < 3 { MODES_2026[bit].to_string() } else { format!("бит {bit}") })
+        .map(|bit| match modes {
+            Some(modes) => modes[bit].to_string(),
+            None if bit < 3 => MODES_4[bit].to_string(),
+            None => format!("бит {bit}"),
+        })
         .collect();
     if names.is_empty() { "нет".into() } else { names.join(", ") }
 }
@@ -400,8 +425,7 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
     let usable = |d: &FrameDef| d.encoding.len() == d.predictor.len() && d.signed.len() >= d.encoding.len();
     let (s_ok, g_ok, h_ok) = (usable(&def_s), usable(&def_g), usable(&def_h));
     let time_idx = names.iter().position(|s| s == "time").ok_or("нет поля time")?;
-    // Раскладка битов режимов полёта сверена с исходниками только для Betaflight 2026.x.
-    let modern = get("Firmware revision").is_some_and(|f| f.starts_with("Betaflight 2026."));
+    let modes = get("Firmware revision").and_then(modes_of);
     let iter_idx = def_p.predictor.iter().position(|&p| p == 6);
 
     let num = |name: &str| get(name).and_then(|v| v.trim().parse::<i32>().ok());
@@ -458,7 +482,7 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
                 usable
             }
             b'E' => {
-                event = parse_event(&mut r, modern);
+                event = parse_event(&mut r, modes);
                 event.is_some()
             }
             _ => false,
@@ -515,6 +539,18 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flight_mode_names_follow_firmware_version() {
+        use super::{mode_names, modes_of};
+        // ARM и AIRMODE: бит 20 в Betaflight 4.x, 23 в 2025.12, 24 в 2026.x.
+        assert_eq!(mode_names(1 | 1 << 20, modes_of("Betaflight 4.5.0 (5cdae1b0c) STM32F7X2")), "ARM, AIRMODE");
+        assert_eq!(mode_names(1 | 1 << 23, modes_of("Betaflight 2025.12.2 (79065c96b) AT32F435M")), "ARM, AIRMODE");
+        assert_eq!(mode_names(1 | 1 << 24, modes_of("Betaflight 2026.6.0-alpha (c40f1e096) STM32G47X")), "ARM, AIRMODE");
+        // Для неизвестной раскладки названы только общие первые три бита.
+        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 9.0.1 (d44f2cf6) DAKEFPVF722")), "ARM, ANGLE, бит 9");
+        assert_eq!(mode_names(0, None), "нет");
+    }
+
     /// Повреждённые и оборванные файлы не должны ронять разбор.
     #[test]
     fn damaged_files_do_not_panic() {

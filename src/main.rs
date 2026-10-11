@@ -919,6 +919,9 @@ fn main() -> eframe::Result {
             for (important, text) in &tabs::overview(loaded).findings {
                 println!("  [{}] {text}", if *important { "важно" } else { "заметка" });
             }
+            for (time, event) in &loaded.log.events {
+                println!("  [событие] {time:.2} с: {event}");
+            }
         }
         if let Some(e) = &app.error {
             eprintln!("{e}");
