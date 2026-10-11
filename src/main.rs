@@ -111,8 +111,60 @@ struct Loaded {
     overview: ForRange<tabs::Overview>,
 }
 
+/// Дописывает в лог поле `target[ось]` копией `source[ось]`, если его ещё нет.
+fn alias(log: &mut bbl::Log, target: &str, source: &str) {
+    for a in 0..3 {
+        if log.col(&format!("{target}[{a}]")).is_none()
+            && let Some(col) = log.col(&format!("{source}[{a}]")).map(<[f32]>::to_vec)
+        {
+            log.names.push(format!("{target}[{a}]"));
+            log.cols.push(col);
+        }
+    }
+}
+
+/// Приводит поля разных прошивок к именам, с которыми работает анализ:
+/// дописывает в лог `setpoint[…]` и `gyroUnfilt[…]`, если они записаны под
+/// другим именем или их можно восстановить.
+fn unify_fields(log: &mut bbl::Log) {
+    alias(log, "setpoint", "axisRate"); // INAV
+    alias(log, "gyroUnfilt", "gyroRAW"); // Rotorflight
+    // Betaflight 4.x и EmuFlight: сырой гироскоп пишется в отладочные поля в режиме GYRO_SCALED.
+    let firmware = log.header("Firmware revision").unwrap_or("").to_string();
+    if log.header("debug_mode").map(str::trim) == Some("6") && (firmware.starts_with("Betaflight 4.") || firmware.starts_with("EmuFlight")) {
+        alias(log, "gyroUnfilt", "debug");
+    }
+
+    // Betaflight 3.x задание не пишет — оно восстанавливается из положения стиков по формуле рейтов.
+    if log.col("setpoint[0]").is_some() || !firmware.starts_with("Betaflight 3.") {
+        return;
+    }
+    for a in 0..3 {
+        let number = |name: &str, index: usize| log.header(name).and_then(|v| v.split(',').nth(index)?.trim().parse::<f32>().ok());
+        let (rate_name, expo_name) = if a == 2 { ("rcYawRate", "rcYawExpo") } else { ("rcRate", "rcExpo") };
+        let (Some(rc_rate), Some(expo), Some(super_rate), Some(stick)) = (number(rate_name, 0), number(expo_name, 0), number("rates", a), log.col(&format!("rcCommand[{a}]"))) else {
+            return;
+        };
+        let (mut rc_rate, expo, super_rate) = (rc_rate / 100.0, expo / 100.0, super_rate / 100.0);
+        if rc_rate > 2.0 {
+            rc_rate += 14.54 * (rc_rate - 2.0);
+        }
+        let setpoint = stick
+            .iter()
+            .map(|&rc| {
+                let stick = (rc / 500.0).clamp(-1.0, 1.0);
+                let curved = stick * stick.abs().powi(3) * expo + stick * (1.0 - expo);
+                200.0 * rc_rate * curved / (1.0 - stick.abs() * super_rate).clamp(0.01, 1.0)
+            })
+            .collect();
+        log.names.push(format!("setpoint[{a}]"));
+        log.cols.push(setpoint);
+    }
+}
+
 impl Loaded {
-    fn new(log: bbl::Log) -> Self {
+    fn new(mut log: bbl::Log) -> Self {
+        unify_fields(&mut log);
         let col = |name: String| log.names.iter().position(|n| *n == name);
         let axis_fields: Vec<AxisField> = AXIS_BASES
             .iter()
@@ -707,7 +759,7 @@ impl eframe::App for App {
                     fact(ui, "Прошивка", l.log.header("Firmware revision").unwrap_or("неизвестна").to_string());
                     fact(ui, "Запись", format!("{:.0} Гц", l.sample_rate));
                     fact(ui, "Длительность", format!("{:.1} с", l.log.time.last().unwrap_or(&0.0)));
-                    fact(ui, "Повреждено кадров", l.log.corrupt.to_string());
+                    fact(ui, "Разрывов записи", l.log.corrupt.to_string());
                     if let Some((name, _)) = &self.compare {
                         fact(ui, "Сравнение, штриховые линии", name.clone());
                     }
@@ -780,7 +832,7 @@ fn main() -> eframe::Result {
     }
     if mode.as_deref() == Some("report") {
         for (i, loaded) in app.logs.iter_mut().enumerate() {
-            println!("Запись {}: {:.0} с, {:.0} Гц", i + 1, loaded.log.time.last().unwrap_or(&0.0), loaded.sample_rate);
+            println!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", i + 1, loaded.log.time.last().unwrap_or(&0.0), loaded.sample_rate, loaded.log.time.len(), loaded.log.corrupt);
             for (important, text) in &tabs::overview(loaded).findings {
                 println!("  [{}] {text}", if *important { "важно" } else { "заметка" });
             }

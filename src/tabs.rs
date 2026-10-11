@@ -265,9 +265,8 @@ fn findings(loaded: &mut Loaded) -> Vec<(bool, String)> {
     if nyquist < 500.0 {
         out.push((true, format!("Лог записан с частотой {:.0} Гц: шум выше {nyquist:.0} Гц в нём не виден, а более высокие частоты отражаются в видимую полосу. Для анализа шума записывайте лог на 2 кГц и выше.", loaded.sample_rate)));
     }
-    let frames = loaded.log.time.len();
-    if loaded.log.corrupt * 100 > frames {
-        out.push((true, format!("Повреждено {} кадров из {frames}: запись на носитель идёт с потерями, в данных есть разрывы.", loaded.log.corrupt)));
+    if loaded.log.corrupt >= 5 {
+        out.push((loaded.log.corrupt >= 50, format!("В записи {} повреждённых участков: носитель не успевает или в файле остались куски старых данных. Вокруг разрывов графикам доверять нельзя.", loaded.log.corrupt)));
     }
 
     ensure_motors(loaded);

@@ -13,7 +13,7 @@ pub struct Log {
     pub cols: Vec<Vec<f32>>,
     /// Время кадра в секундах от начала лога.
     pub time: Vec<f64>,
-    /// Сколько кадров отброшено как повреждённые.
+    /// Сколько в записи повреждённых участков (разрывов), где кадры не читаются.
     pub corrupt: usize,
     /// События лога: `(время, с; описание)`.
     pub events: Vec<(f64, String)>,
@@ -405,6 +405,7 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
     let (mut cur, mut prev, mut prev2) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
     let mut scratch = vec![0i32; def_s.encoding.len().max(def_g.encoding.len()).max(def_h.encoding.len())];
     let mut stream_valid = false; // можно ли опираться на prev для P-кадров
+    let mut in_garbage = false; // идёт повреждённый участок
     let (mut last_time, mut time_hi, mut t0) = (0u32, 0u64, None);
     let mut last_us = 0u64;
 
@@ -478,12 +479,15 @@ fn parse_log(data: &[u8]) -> Result<Log, String> {
             log.events.push((log.time.last().copied().unwrap_or(0.0), event));
         }
         if !ok {
-            if b"IPSGHE".contains(&kind) {
+            // Внутри повреждённого участка случайные байты то и дело похожи на начало
+            // кадра — участок считается один раз, а не по числу таких совпадений.
+            if !in_garbage {
                 log.corrupt += 1;
             }
             stream_valid &= !matches!(kind, b'I' | b'P');
             r.pos = start + 1;
         }
+        in_garbage = !ok;
         if end_of_log {
             break;
         }
