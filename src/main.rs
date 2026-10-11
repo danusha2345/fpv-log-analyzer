@@ -486,11 +486,15 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             for (base, by_axis) in compared.into_iter().flatten() {
                 plot.line(line(base, by_axis[a].clone()).name(format!("{base}, сравнение")).style(LineStyle::dashed_loose()));
             }
-            // Подписи идут лесенкой, чтобы соседние частоты не накладывались.
-            let (top, step) = (plot.plot_bounds().max()[1], plot.plot_bounds().height() * 0.07);
+            // Подписи идут лесенкой, чтобы соседние частоты не накладывались. Высота
+            // берётся от самих спектров, а не от границ графика: иначе подписи раздвигали
+            // бы границы, а те в ответ поднимали бы подписи.
+            let levels = || spectra.iter().flat_map(|(_, by_axis)| &by_axis[a]).map(|p| p[1]);
+            let (bottom, top) = (levels().fold(f64::INFINITY, f64::min), levels().fold(f64::NEG_INFINITY, f64::max));
+            let step = (top - bottom) * 0.07;
             for (k, (name, hz)) in marks.iter().enumerate() {
                 plot.vline(VLine::new(name, *hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
-                if a == 0 {
+                if a == 0 && top.is_finite() {
                     let label = Text::new(name, PlotPoint::new(*hz, top - step * (k % 5) as f64), format!(" {name} {hz:.0}"));
                     plot.text(label.color(theme::MUTED).anchor(egui::Align2::LEFT_TOP));
                 }
@@ -749,7 +753,8 @@ impl App {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            // С переносом: при выборе записи и в узком окне вкладки уходят на вторую строку, а не за край.
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Открыть лог…").clicked()
                     && let Some(path) = pick_log()
                 {

@@ -55,6 +55,9 @@ pub fn welch_db(x: &[f32], fs: f64) -> Vec<[f64; 2]> {
     }
     let h = n / 2 + 1;
     let power = stft(x, fs, n, n / 2);
+    if power.iter().all(|&p| p == 0.0) {
+        return Vec::new(); // сигнал постоянен (поле не используется) — рисовать нечего
+    }
     let frames = (power.len() / h) as f32;
     (1..h) // постоянная составляющая вычтена
         .map(|f| {
