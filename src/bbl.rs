@@ -328,7 +328,7 @@ fn parse_event(r: &mut Reader) -> Option<String> {
         15 => format!("Дизарм, причина {}", r.unsigned_vb()),
         30 => {
             let (now, before) = (r.unsigned_vb(), r.unsigned_vb());
-            format!("Режимы полёта: {before:#x} → {now:#x}")
+            format!("Режимы полёта: {} → {}", mode_names(before), mode_names(now))
         }
         255 => {
             const END: &[u8] = b"End of log\0";
@@ -342,6 +342,21 @@ fn parse_event(r: &mut Reader) -> Option<String> {
 }
 
 const END_OF_LOG: &str = "Конец записи";
+
+/// Включённые режимы полёта по битовой маске. Первые три бита одинаковы во всех
+/// версиях Betaflight; раскладка остальных зависит от версии, поэтому они без названий.
+fn mode_names(mask: u32) -> String {
+    let names: Vec<String> = (0..32)
+        .filter(|bit| mask >> bit & 1 != 0)
+        .map(|bit| match bit {
+            0 => "ARM".into(),
+            1 => "ANGLE".into(),
+            2 => "HORIZON".into(),
+            _ => format!("бит {bit}"),
+        })
+        .collect();
+    if names.is_empty() { "нет".into() } else { names.join(", ") }
+}
 
 fn parse_list<T: std::str::FromStr>(value: &str) -> Vec<T> {
     value.split(',').filter_map(|s| s.trim().parse().ok()).collect()

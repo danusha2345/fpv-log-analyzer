@@ -212,7 +212,14 @@ pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResp
         }
     }
     a[bins - 1].im = 0.0; // частота Найквиста у вещественного сигнала вещественна
-    a[0].im = 0.0;
+    // Нулевая частота задаёт установившийся уровень отклика, а по окну в 2 с она
+    // оценивается хуже всего и стягивалась бы к нулю, занижая этот уровень.
+    // Берётся усиление соседних частот (0.5–1.5 Гц): там оно то же, а оценка надёжна.
+    let low = &weighted[1..4.min(bins)];
+    let low_weight: f32 = low.iter().map(|w| w.1).sum();
+    if low_weight > 0.0 {
+        a[0] = realfft::num_complex::Complex::new((low.iter().map(|w| w.0).sum::<realfft::num_complex::Complex<f32>>() / low_weight).norm(), 0.0);
+    }
     ifft.process(&mut a, &mut buf).unwrap();
     let mut acc = 0.0;
     let points = buf[..len]
@@ -349,6 +356,39 @@ mod tests {
         let near = r.bode.iter().min_by(|a, b| (a[0] - 8.0).abs().total_cmp(&(b[0] - 8.0).abs())).unwrap();
         assert!((near[1] + 3.0).abs() < 1.0 && (near[2] + 45.0).abs() < 8.0, "на {} Гц: {} дБ, {}°", near[0], near[1], near[2]);
         assert!((r.bandwidth_hz().unwrap() - 8.0).abs() < 1.5);
+    }
+
+    /// Колебательная система (ζ = 0.3, 20 Гц) с шумом гироскопа и «пилотным» заданием:
+    /// перерегулирование известно заранее — 37 %, пик на 26 мс.
+    #[test]
+    fn step_response_of_underdamped_system() {
+        let (zeta, wn, dt) = (0.3f64, std::f64::consts::TAU * 20.0, 1.0 / FS);
+        let (mut seed, mut target, mut stick) = (11u32, 0f64, 0f64);
+        let mut random = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f64 / 8_388_608.0 - 1.0
+        };
+        let (mut y, mut v) = (0f64, 0f64);
+        let (mut setpoint, mut gyro) = (Vec::new(), Vec::new());
+        for i in 0..120_000 {
+            if i % 400 == 0 {
+                target = random() * 300.0;
+            }
+            stick += (target - stick) * 0.08; // стик двигается плавно, не мгновенной ступенькой
+            for _ in 0..10 {
+                // интегрирование с мелким шагом
+                let a = wn * wn * (stick - y) - 2.0 * zeta * wn * v;
+                v += a * dt / 10.0;
+                y += v * dt / 10.0;
+            }
+            setpoint.push(stick as f32);
+            gyro.push((y + random() * 8.0) as f32);
+        }
+        let r = step_response(&setpoint, &gyro, FS).unwrap();
+        let (peak_ms, peak) = r.points.iter().fold((0.0, 0.0), |best, p| if p[1] > best.1 { (p[0], p[1]) } else { best });
+        let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
+        eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
+        assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
     }
 
     /// Шум без повторов — для проверки задержек и фильтров.

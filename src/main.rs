@@ -100,6 +100,8 @@ struct Loaded {
     other_fields: Vec<(usize, bool)>,
     /// Участок лога, видимый на кривых (номера кадров); по нему считается весь анализ, кроме карт.
     range: (usize, usize),
+    /// Просьба вернуть на кривых масштаб «весь лог».
+    reset_zoom: bool,
     spectra: ForRange<Spectra>,
     /// Задержка `gyroADC` относительно `gyroUnfilt` по осям, мс.
     delays: ForRange<[Option<f64>; 3]>,
@@ -179,6 +181,7 @@ impl Loaded {
         Self {
             sample_rate: log.sample_rate(),
             range: (0, log.time.len()),
+            reset_zoom: false,
             axis_fields,
             other_fields,
             spectra: None,
@@ -391,6 +394,9 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
             plot = plot.x_axis_label("время, с");
         }
         plot.show(ui, |plot| {
+            if loaded.reset_zoom {
+                plot.set_auto_bounds([true, true]);
+            }
             if row == 0 {
                 // Пока масштаб автоматический, показываем весь лог: иначе границы
                 // подстраивались бы под уже обрезанные по ним же точки.
@@ -418,6 +424,7 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
         });
     }
     loaded.range = range;
+    loaded.reset_zoom = false;
 }
 
 fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
@@ -563,6 +570,20 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
         if with_x_label {
             plot = plot.x_axis_label(x_label);
         }
+        // В углу — что под курсором: положение по осям и уровень в этой ячейке.
+        let grid = set.grids[a].as_ref();
+        let readout = move |point: &PlotPoint, _: &egui_plot::PlotBounds| {
+            let unit = ["%", "с", "Гц"][kind as usize];
+            let level = grid.and_then(|g| {
+                let (x, y) = (point.x / set.x_max * g.w as f64, point.y / f_max * (g.h - 1) as f64);
+                ((0.0..g.w as f64).contains(&x) && (0.0..g.h as f64).contains(&y)).then(|| g.db[x as usize * g.h + y as usize])
+            });
+            match level.filter(|db| !db.is_nan()) {
+                Some(db) => format!("{:.1} {unit}, {:.0} Гц: {db:.0} дБ", point.x, point.y),
+                None => format!("{:.1} {unit}, {:.0} Гц: нет данных", point.x, point.y),
+            }
+        };
+        plot = plot.coordinates_formatter(egui_plot::Corner::RightTop, egui_plot::CoordinatesFormatter::new(readout));
         plot.show(ui, |plot| {
             let center = PlotPoint::new(set.x_max / 2.0, f_max / 2.0);
             plot.image(PlotImage::new(AXES[a], texture.id(), center, [set.x_max as f32, f_max as f32]));
@@ -749,6 +770,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
+        let mut whole_log = false;
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| match (&self.error, self.logs.get(self.current)) {
                 (Some(e), _) => {
@@ -760,6 +782,11 @@ impl eframe::App for App {
                     fact(ui, "Запись", format!("{:.0} Гц", l.sample_rate));
                     fact(ui, "Длительность", format!("{:.1} с", l.log.time.last().unwrap_or(&0.0)));
                     fact(ui, "Разрывов записи", l.log.corrupt.to_string());
+                    if l.range != (0, l.log.time.len()) {
+                        let (lo, hi) = l.range;
+                        fact(ui, "Анализируется участок", format!("{:.2}–{:.2} с", l.log.time[lo], l.log.time[hi.max(lo + 1) - 1]));
+                        whole_log = ui.button("Весь лог").clicked();
+                    }
                     if let Some((name, _)) = &self.compare {
                         fact(ui, "Сравнение, штриховые линии", name.clone());
                     }
@@ -770,6 +797,10 @@ impl eframe::App for App {
                 (None, None) => {}
             });
         });
+
+        if let (true, Some(l)) = (whole_log, self.logs.get_mut(self.current)) {
+            (l.range, l.reset_zoom) = ((0, l.log.time.len()), true);
+        }
 
         let Some(loaded) = self.logs.get_mut(self.current) else {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -816,11 +847,29 @@ impl eframe::App for App {
     }
 }
 
+/// Печатает запись в CSV: время от начала в микросекундах и все поля как в логе.
+fn write_csv(log: &bbl::Log) {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    // Ошибка записи значит, что читатель закрыл поток (`| head`) — молча прекращаем.
+    let mut line = |text: String| writeln!(out, "{text}").is_ok();
+    if !line(format!("time_us,{}", log.names.join(","))) {
+        return;
+    }
+    for (row, time) in log.time.iter().enumerate() {
+        let values: Vec<String> = log.cols.iter().map(|c| c[row].to_string()).collect();
+        if !line(format!("{:.0},{}", time * 1e6, values.join(","))) {
+            return;
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, harmonics: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
     let mut app = App { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None };
     // Аргументы: лог; вкладка при запуске либо `report` (напечатать находки
-    // по каждой записи и выйти, без окна); лог для сравнения.
+    // по каждой записи и выйти, без окна) либо `csv` (выгрузить запись
+    // в CSV на стандартный вывод); лог для сравнения.
     // Вкладка с окончанием `+save` — сохранить её снимок рядом с логом и выйти.
     let mut args = std::env::args().skip(1);
     if let Some(path) = args.next() {
@@ -829,6 +878,15 @@ fn main() -> eframe::Result {
     let mut mode = args.next();
     if let Some(tab) = mode.as_deref().and_then(|m| m.strip_suffix("+save")) {
         (mode, app.snapshot_in) = (Some(tab.to_string()), Some(20));
+    }
+    if mode.as_deref() == Some("csv") {
+        // Третий аргумент — номер записи в файле, по умолчанию первая.
+        let index = args.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
+        match app.logs.get(index.wrapping_sub(1)) {
+            Some(loaded) => write_csv(&loaded.log),
+            None => eprintln!("{}", app.error.unwrap_or(format!("В файле нет записи {index}"))),
+        }
+        return Ok(());
     }
     if mode.as_deref() == Some("report") {
         for (i, loaded) in app.logs.iter_mut().enumerate() {
