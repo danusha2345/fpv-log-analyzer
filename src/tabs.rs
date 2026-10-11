@@ -7,6 +7,33 @@ use crate::{AXES, Loaded, View, dsp, line, new_plot, row_height, swatch, theme};
 
 pub type Steps = [Option<dsp::StepResponse>; 3];
 
+/// Печатает результаты анализа первой записи таблицей — для сверки с другими
+/// программами: `step,ось,мс,отклик`; `bode,ось,Гц,дБ,градусы`;
+/// `delay,ось,мс` (задержка фильтров гироскопа); `psd,сигнал,ось,Гц,дБ`.
+pub fn print_response(loaded: &mut Loaded) {
+    for (axis, delay) in AXES.iter().zip(loaded.delays()) {
+        if let Some(ms) = delay {
+            println!("delay,{axis},{ms:.3}");
+        }
+    }
+    for (base, by_axis) in loaded.spectra().clone() {
+        for (axis, spectrum) in AXES.iter().zip(&by_axis) {
+            for p in spectrum {
+                println!("psd,{base},{axis},{:.3},{:.3}", p[0], p[1]);
+            }
+        }
+    }
+    ensure_steps(loaded);
+    for (axis, step) in AXES.iter().zip(&loaded.steps.as_ref().unwrap().1) {
+        for p in step.iter().flat_map(|s| &s.points) {
+            println!("step,{axis},{:.2},{:.4}", p[0], p[1]);
+        }
+        for p in step.iter().flat_map(|s| &s.bode) {
+            println!("bode,{axis},{:.3},{:.3},{:.2}", p[0], p[1], p[2]);
+        }
+    }
+}
+
 fn ensure_steps(loaded: &mut Loaded) {
     if loaded.steps.as_ref().is_none_or(|(range, _)| *range != loaded.range) {
         let (lo, hi) = loaded.range;

@@ -36,6 +36,7 @@ cargo run --release -- путь/к/логу.bbl
 ```bash
 fpv-log-analyzer лог.bbl report          # находки текстом
 fpv-log-analyzer лог.bbl csv [номер]     # запись в CSV на стандартный вывод
+fpv-log-analyzer лог.bbl response        # спектры, задержка, отклик и ЧХ таблицей
 fpv-log-analyzer лог.bbl step+save       # снимок вкладки в PNG и выход
 ```
 
@@ -49,11 +50,14 @@ fpv-log-analyzer лог.bbl step+save       # снимок вкладки в PNG
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
+Если на машине нет Vulkan / DirectX 12, окно откроется через OpenGL.
+
 ## Проверка
 
 ```bash
 cargo test --release
 python3 tools/compare_with_blackbox_decode.py папка_с_логами   # сверка разбора с blackbox_decode
+python3 tools/crosscheck_scipy.py лог.bbl                      # сверка анализа со scipy
 ```
 
 Состояние, план и известные слабые места — в [docs/TRACKER.md](docs/TRACKER.md).

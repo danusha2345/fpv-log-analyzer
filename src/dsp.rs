@@ -37,7 +37,11 @@ fn stft(x: &[f32], fs: f64, n: usize, hop: usize) -> Vec<f32> {
             *b = (s - mean) * w;
         }
         fft.process(&mut buf, &mut out).unwrap();
+        let frame = power.len();
         power.extend(out.iter().map(|c| c.norm_sqr() * scale));
+        // Нулевая частота и частота Найквиста в односторонний спектр входят один раз, без удвоения.
+        power[frame] /= 2.0;
+        *power.last_mut().unwrap() /= 2.0;
     }
     power
 }
@@ -122,7 +126,8 @@ impl StepResponse {
 
 /// Отклик системы «задание → гироскоп» на ступеньку. В каждом окне (2 с, окно
 /// Ханна) оценивается передаточная функция; по окнам берётся медиана на каждой
-/// частоте — так окна с ударом или срывом не искажают результат, и отбор окон
+/// частоте, взвешенная энергией задания, — так окна с ударом или срывом и окна
+/// без движений стиков не искажают результат, и отбор окон
 /// по «правдоподобию» (который смещает оценку вверх) не нужен. Обратное
 /// преобразование даёт импульсную характеристику, её накопленная сумма — отклик.
 /// Окна, где стики не двигали, в оценку не входят; если таких окон мало
@@ -141,7 +146,9 @@ pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResp
     let (fft, ifft) = (planner.plan_fft_forward(n), planner.plan_fft_inverse(n));
     let (mut buf, mut a, mut b) = (fft.make_input_vec(), fft.make_output_vec(), fft.make_output_vec());
     let bins = a.len();
-    // Оценки по окнам: `re[частота]` и `im[частота]` — значения по всем окнам.
+    // Оценки по окнам: `re[частота]` и `im[частота]` — пары (значение, вес) по всем окнам.
+    // Вес — энергия задания в окне на этой частоте: окно, где стики на ней почти
+    // не двигались, даёт шум, а не оценку, и не должно весить столько же, сколько информативное.
     let (mut re, mut im) = (vec![Vec::new(); bins], vec![Vec::new(); bins]);
     for (x, y) in setpoint.windows(n).zip(gyro.windows(n)).step_by(n / 4) {
         if x.iter().fold(0f32, |m, v| m.max(v.abs())) < MIN_INPUT {
@@ -156,31 +163,48 @@ pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResp
         let floor = a.iter().map(|c| c.norm_sqr()).sum::<f32>() / bins as f32 * 1e-4;
         for i in 0..bins {
             let h = b[i] * a[i].conj() / (a[i].norm_sqr() + floor);
-            re[i].push(h.re);
-            im[i].push(h.im);
+            re[i].push((h.re, a[i].norm_sqr()));
+            im[i].push((h.im, a[i].norm_sqr()));
         }
     }
     let windows = re[0].len();
     if windows < MIN_WINDOWS {
         return None; // по нескольким окнам медиана — сама шум
     }
-    // Медиана и квадрат её стандартной ошибки (через медианное абсолютное отклонение).
-    let median = |v: &mut Vec<f32>| {
-        let m = *v.select_nth_unstable_by(windows / 2, f32::total_cmp).1;
-        v.iter_mut().for_each(|x| *x = (*x - m).abs());
-        let sigma = 1.4826 * *v.select_nth_unstable_by(windows / 2, f32::total_cmp).1;
-        (m, sigma * sigma * std::f32::consts::FRAC_PI_2 / windows as f32)
+    // Взвешенная медиана и квадрат её стандартной ошибки (через медианное абсолютное отклонение).
+    let weighted_median = |v: &mut [(f32, f32)]| {
+        v.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let half = v.iter().map(|x| x.1).sum::<f32>() / 2.0;
+        let mut acc = 0.0;
+        v.iter().find(|x| { acc += x.1; acc >= half }).map_or(0.0, |x| x.0)
+    };
+    let median = |v: &mut Vec<(f32, f32)>| {
+        // Вес ограничен сверху тремя медианными: иначе одно окно с огромной энергией
+        // (удар, срыв) перевесило бы все остальные, и медиана перестала бы от него защищать.
+        let mut energies: Vec<f32> = v.iter().map(|x| x.1).collect();
+        let cap = 3.0 * *energies.select_nth_unstable_by(windows / 2, f32::total_cmp).1;
+        v.iter_mut().for_each(|x| x.1 = x.1.min(cap));
+        let m = weighted_median(v);
+        v.iter_mut().for_each(|x| x.0 = (x.0 - m).abs());
+        let sigma = 1.4826 * weighted_median(v);
+        // Число окон, реально участвующих в оценке: при неравных весах оно меньше общего.
+        let (sum, squares) = v.iter().fold((0.0, 0.0), |(s, q), x| (s + x.1, q + x.1 * x.1));
+        let effective = if squares > 0.0 { sum * sum / squares } else { 1.0 };
+        (m, sigma * sigma * std::f32::consts::FRAC_PI_2 / effective)
     };
     // Доверие к оценке на частотах 1–20 Гц, где и формируется отклик.
     let (mut trust, mut trusted) = (0.0, 0);
     let mut weighted = vec![(realfft::num_complex::Complex::new(0f32, 0f32), 0f32); bins];
     for i in 0..bins {
         let ((m_re, var_re), (m_im, var_im)) = (median(&mut re[i]), median(&mut im[i]));
-        // Там, где окна расходятся между собой сильнее самой оценки, она стягивается к нулю:
-        // шум на частотах без движений стиков не превращается в ложные выбросы отклика.
+        // Доверие к оценке: доля сигнала в «сигнал + разброс между окнами».
         let (signal, noise) = (m_re * m_re + m_im * m_im, var_re + var_im);
         let weight = if signal > 0.0 { signal / (signal + noise) } else { 0.0 };
-        a[i] = realfft::num_complex::Complex::new(m_re, m_im) * weight;
+        // Надёжные оценки (доверие от 0.6) идут в отклик как есть: умножение на доверие
+        // занижало бы усиление на всех частотах сразу. Ненадёжные (ниже 0.3) отбрасываются,
+        // чтобы шум на частотах без движений стиков не давал ложных выбросов; между — плавный переход.
+        let keep = ((weight - 0.3) / 0.3).clamp(0.0, 1.0);
+        a[i] = realfft::num_complex::Complex::new(m_re, m_im) * keep;
         let hz = i as f64 * fs / n as f64;
         if (1.0..=20.0).contains(&hz) {
             trust += weight;
@@ -237,11 +261,17 @@ pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResp
 /// задержка фильтра. Берётся из наклона фазы взаимного спектра в полосе
 /// 5–80 Гц: сдвиг на время τ даёт фазу −2π·f·τ.
 pub fn delay_ms(raw: &[f32], filtered: &[f32], fs: f64) -> Option<f64> {
-    let n = pow2_at_most(fs / 2.0);
     let len = raw.len().min(filtered.len());
+    let n = pow2_at_most(fs.min(len as f64 / 8.0));
     if len < 8 * n {
         return None;
     }
+    // Оба сигнала заменяются приращениями: это убирает перевес медленных манёвров,
+    // мощность которых иначе «протекает» в соседние частоты и тянет фазу к нулю.
+    // Задержку между сигналами одинаковое преобразование обоих не меняет.
+    let diff = |x: &[f32]| -> Vec<f32> { x[..len].windows(2).map(|w| w[1] - w[0]).collect() };
+    let (raw, filtered) = (diff(raw), diff(filtered));
+    let len = len - 1;
     let window: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos()).collect();
     let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n);
     let (mut buf, mut a, mut b) = (fft.make_input_vec(), fft.make_output_vec(), fft.make_output_vec());

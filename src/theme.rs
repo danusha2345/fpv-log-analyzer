@@ -85,6 +85,8 @@ pub fn apply(ctx: &egui::Context) {
     fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "plex".into());
     ctx.set_fonts(fonts);
 
+    // Оформление рассчитано на тёмную тему и не должно зависеть от темы системы.
+    ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.global_style()).clone();
     for (text_style, size) in [(TextStyle::Small, 12.0), (TextStyle::Body, 14.0), (TextStyle::Button, 14.0), (TextStyle::Heading, 18.0)] {
         style.text_styles.insert(text_style, FontId::proportional(size));

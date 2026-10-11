@@ -512,6 +512,18 @@ fn colorbar(ui: &mut egui::Ui, top_db: f32, range_db: f32) {
     ui.colored_label(theme::MUTED, format!("{top_db:.0} дБ"));
 }
 
+/// Подпись под курсором на карте: положение по осям и уровень в ячейке матрицы.
+fn map_readout(grid: Option<&dsp::Grid>, unit: &str, x_max: f64, f_max: f64, x: f64, hz: f64) -> String {
+    let level = grid.and_then(|g| {
+        let (col, row) = (x / x_max * g.w as f64, hz / f_max * (g.h - 1) as f64);
+        ((0.0..g.w as f64).contains(&col) && (0.0..g.h as f64).contains(&row)).then(|| g.db[col as usize * g.h + row as usize])
+    });
+    match level.filter(|db| !db.is_nan()) {
+        Some(db) => format!("{x:.1} {unit}, {hz:.0} Гц: {db:.0} дБ"),
+        None => format!("{x:.1} {unit}, {hz:.0} Гц: нет данных"),
+    }
+}
+
 /// Карты шума по трём осям: спектрограмма (оси друг под другом) или шум
 /// от режима — газа либо оборотов (оси рядом).
 fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &mut View) {
@@ -572,17 +584,8 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
         }
         // В углу — что под курсором: положение по осям и уровень в этой ячейке.
         let grid = set.grids[a].as_ref();
-        let readout = move |point: &PlotPoint, _: &egui_plot::PlotBounds| {
-            let unit = ["%", "с", "Гц"][kind as usize];
-            let level = grid.and_then(|g| {
-                let (x, y) = (point.x / set.x_max * g.w as f64, point.y / f_max * (g.h - 1) as f64);
-                ((0.0..g.w as f64).contains(&x) && (0.0..g.h as f64).contains(&y)).then(|| g.db[x as usize * g.h + y as usize])
-            });
-            match level.filter(|db| !db.is_nan()) {
-                Some(db) => format!("{:.1} {unit}, {:.0} Гц: {db:.0} дБ", point.x, point.y),
-                None => format!("{:.1} {unit}, {:.0} Гц: нет данных", point.x, point.y),
-            }
-        };
+        let unit = ["%", "с", "Гц"][kind as usize];
+        let readout = move |point: &PlotPoint, _: &egui_plot::PlotBounds| map_readout(grid, unit, set.x_max, f_max, point.x, point.y);
         plot = plot.coordinates_formatter(egui_plot::Corner::RightTop, egui_plot::CoordinatesFormatter::new(readout));
         plot.show(ui, |plot| {
             let center = PlotPoint::new(set.x_max / 2.0, f_max / 2.0);
@@ -709,6 +712,17 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    fn new() -> Self {
+        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, harmonics: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
+        Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None }
+    }
+
+    fn draw(&mut self, ui: &mut egui::Ui) {
         if let Some(path) = ui.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open(&path);
         }
@@ -865,11 +879,11 @@ fn write_csv(log: &bbl::Log) {
 }
 
 fn main() -> eframe::Result {
-    let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, harmonics: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
-    let mut app = App { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None };
+    let mut app = App::new();
     // Аргументы: лог; вкладка при запуске либо `report` (напечатать находки
     // по каждой записи и выйти, без окна) либо `csv` (выгрузить запись
-    // в CSV на стандартный вывод); лог для сравнения.
+    // в CSV на стандартный вывод) либо `response` (отклик на ступеньку и частотная
+    // характеристика первой записи таблицей); лог для сравнения.
     // Вкладка с окончанием `+save` — сохранить её снимок рядом с логом и выйти.
     let mut args = std::env::args().skip(1);
     if let Some(path) = args.next() {
@@ -885,6 +899,12 @@ fn main() -> eframe::Result {
         match app.logs.get(index.wrapping_sub(1)) {
             Some(loaded) => write_csv(&loaded.log),
             None => eprintln!("{}", app.error.unwrap_or(format!("В файле нет записи {index}"))),
+        }
+        return Ok(());
+    }
+    if mode.as_deref() == Some("response") {
+        if let Some(loaded) = app.logs.first_mut() {
+            tabs::print_response(loaded);
         }
         return Ok(());
     }
@@ -909,13 +929,104 @@ fn main() -> eframe::Result {
     if let Some(path) = args.next() {
         app.open_compare(Path::new(&path));
     }
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]), ..Default::default() };
-    eframe::run_native(
-        "FPV Log Analyzer",
-        options,
-        Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    )
+    // Приложение лежит в общей ячейке: если первая попытка открыть окно не удалась
+    // до его создания, вторая заберёт его оттуда же.
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(Some(app)));
+    let run = |renderer| {
+        let slot = slot.clone();
+        let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]), renderer, ..Default::default() };
+        eframe::run_native(
+            "FPV Log Analyzer",
+            options,
+            Box::new(move |cc| {
+                theme::apply(&cc.egui_ctx);
+                Ok(Box::new(slot.borrow_mut().take().expect("приложение создаётся один раз")))
+            }),
+        )
+    };
+    match run(eframe::Renderer::Wgpu) {
+        // Видеокарта или драйвер не дали Vulkan / DirectX 12 / Metal — рисуем через OpenGL.
+        Err(_) if slot.borrow().is_some() => run(eframe::Renderer::Glow),
+        result => result,
+    }
+}
+
+/// Проверки интерфейса без окна: вкладки, зум, строка состояния.
+/// Пропускаются, если образца лога нет на диске.
+#[cfg(test)]
+mod ui_tests {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    use super::*;
+
+    fn harness() -> Option<Harness<'static, App>> {
+        let mut app = App::new();
+        app.open(Path::new(&(std::env::var("HOME").unwrap() + "/storage/adrc-8ksal8-goodtune/ADRC_Good_Tune.bbl")));
+        if app.logs.is_empty() {
+            return None;
+        }
+        Some(Harness::builder().with_size([1400.0, 900.0]).build_ui_state(|ui, app: &mut App| app.draw(ui), app))
+    }
+
+    fn whole_log(app: &App) -> bool {
+        app.logs[0].range == (0, app.logs[0].log.time.len())
+    }
+
+    #[test]
+    fn every_tab_opens() {
+        let Some(mut harness) = harness() else { return };
+        for (tab, name, _) in TABS {
+            harness.get_by_label(name).click();
+            harness.run_steps(4);
+            assert!(harness.state().tab == tab, "вкладка «{name}» не открылась");
+        }
+        // Переключатели внутри вкладок тоже должны отрисовываться без падений.
+        harness.state_mut().tab = Tab::Heatmap;
+        harness.state_mut().view.by_rpm = true;
+        harness.run_steps(4);
+        harness.state_mut().tab = Tab::Spectrum;
+        harness.state_mut().view.trial_on = true;
+        harness.run_steps(4);
+        assert!(harness.query_by_label_contains("задержка с ним").is_some());
+    }
+
+    #[test]
+    fn zoom_selects_range_and_button_resets_it() {
+        let Some(mut harness) = harness() else { return };
+        harness.get_by_label("Кривые").click();
+        harness.run_steps(4);
+        assert!(whole_log(harness.state()));
+        assert!(harness.query_by_label("Весь лог").is_none());
+
+        // Зум над графиком Roll сужает участок анализа.
+        harness.hover_at(egui::pos2(800.0, 200.0));
+        harness.run_steps(2);
+        harness.event(egui::Event::Zoom(4.0));
+        harness.run_steps(4);
+        let (lo, hi) = harness.state().logs[0].range;
+        let frames = harness.state().logs[0].log.time.len();
+        assert!(hi - lo < frames / 2, "после зума участок {lo}..{hi} из {frames}");
+        assert!(harness.query_by_label("Анализируется участок").is_some());
+
+        // Анализ на других вкладках идёт по этому участку.
+        harness.get_by_label("Спектр").click();
+        harness.run_steps(4);
+        assert_eq!(harness.state().logs[0].spectra.as_ref().unwrap().0, (lo, hi));
+
+        harness.get_by_label("Весь лог").click();
+        harness.run_steps(4);
+        assert!(whole_log(harness.state()));
+        harness.get_by_label("Кривые").click();
+        harness.run_steps(6);
+        assert!(whole_log(harness.state()), "масштаб кривых не вернулся ко всему логу");
+        assert!(harness.query_by_label("Весь лог").is_none());
+    }
+
+    #[test]
+    fn map_readout_reports_cell_level() {
+        let grid = dsp::Grid { w: 2, h: 3, db: vec![1.0, 2.0, 3.0, f32::NAN, 5.0, 6.0] };
+        assert_eq!(map_readout(Some(&grid), "%", 100.0, 500.0, 25.0, 250.0), "25.0 %, 250 Гц: 2 дБ");
+        assert_eq!(map_readout(Some(&grid), "%", 100.0, 500.0, 75.0, 10.0), "75.0 %, 10 Гц: нет данных");
+        assert_eq!(map_readout(Some(&grid), "%", 100.0, 500.0, 150.0, 10.0), "150.0 %, 10 Гц: нет данных");
+    }
 }
