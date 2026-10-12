@@ -195,6 +195,49 @@ impl StepResponse {
         let last_passing = self.bode.iter().rposition(|p| p[1] >= -3.0)?;
         self.bode.get(last_passing + 1).map(|p| p[0])
     }
+
+    /// Запасы устойчивости контура по измеренной характеристике «задание → гироскоп» T.
+    /// Разомкнутый контур восстанавливается как L = T / (1 − T) — это верно, пока
+    /// feedforward мал: он добавляет в T слагаемое в обход обратной связи.
+    pub fn margins(&self) -> Option<Margins> {
+        use realfft::num_complex::Complex;
+        let closed = |p: &[f64; 3]| Complex::from_polar(10f64.powf(p[1] / 20.0), p[2].to_radians());
+        // Пик ошибки слежения |1 − T|: насколько контур усиливает рассогласование на худшей частоте.
+        let (error_peak_hz, error_peak_db) = self.bode.iter().map(|p| (p[0], 20.0 * (Complex::new(1.0, 0.0) - closed(p)).norm().log10())).max_by(|a, b| a.1.total_cmp(&b.1))?;
+        // Усиление (дБ) и развёрнутая фаза (°) разомкнутого контура по точкам.
+        let mut phase = 0.0;
+        let open: Vec<[f64; 3]> = self
+            .bode
+            .iter()
+            .map(|p| {
+                let l = closed(p) / (Complex::new(1.0, 0.0) - closed(p));
+                phase += (l.arg().to_degrees() - phase + 180.0).rem_euclid(360.0) - 180.0;
+                [p[0], 20.0 * l.norm().log10(), phase]
+            })
+            .collect();
+        // Частота среза — где усиление разомкнутого контура впервые опускается ниже единицы.
+        let after = open.windows(2).position(|w| w[0][1] >= 0.0 && w[1][1] < 0.0)?;
+        let (a, b) = (open[after], open[after + 1]);
+        let t = a[1] / (a[1] - b[1]); // доля пути между точками, по логарифму частоты
+        Some(Margins {
+            crossover_hz: a[0] * (b[0] / a[0]).powf(t),
+            // Фаза развёрнута от произвольного начала, поэтому запас приводится к −180…180°.
+            phase_margin_deg: (a[2] + (b[2] - a[2]) * t).rem_euclid(360.0) - 180.0,
+            error_peak_db,
+            error_peak_hz,
+        })
+    }
+}
+
+/// Запасы устойчивости контура, см. [`StepResponse::margins`].
+pub struct Margins {
+    /// Частота среза разомкнутого контура, Гц.
+    pub crossover_hz: f64,
+    /// Запас по фазе на частоте среза, °. Меньше 45° — контур склонен к раскачке.
+    pub phase_margin_deg: f64,
+    /// Наибольшее усиление ошибки слежения |1 − T|, дБ, и частота, где оно достигается.
+    pub error_peak_db: f64,
+    pub error_peak_hz: f64,
 }
 
 /// Отклик системы «задание → гироскоп» на ступеньку. В каждом окне (2 с, окно
@@ -206,6 +249,13 @@ impl StepResponse {
 /// Окна, где стики не двигали, в оценку не входят; если таких окон мало
 /// или они плохо согласуются между собой, отклик не выдаётся.
 pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResponse> {
+    step_response_where(setpoint, gyro, fs, &|_, _| true)
+}
+
+/// То же, что [`step_response`], но только по окнам, для которых `keep` вернул
+/// истину: ему передаются номер первого отсчёта окна и задание в окне. Так
+/// отклик считается отдельно для плавных и резких движений или для разного газа.
+pub fn step_response_where(setpoint: &[f32], gyro: &[f32], fs: f64, keep: &dyn Fn(usize, &[f32]) -> bool) -> Option<StepResponse> {
     const MIN_INPUT: f32 = 20.0; // град/с
     const MIN_TRUST: f32 = 0.5;
     const MIN_WINDOWS: usize = 30; // окна идут через 0.5 с: нужно от 15 с движений стиков
@@ -223,8 +273,8 @@ pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResp
     // Вес — энергия задания в окне на этой частоте: окно, где стики на ней почти
     // не двигались, даёт шум, а не оценку, и не должно весить столько же, сколько информативное.
     let (mut re, mut im) = (vec![Vec::new(); bins], vec![Vec::new(); bins]);
-    for (x, y) in setpoint.windows(n).zip(gyro.windows(n)).step_by(n / 4) {
-        if x.iter().fold(0f32, |m, v| m.max(v.abs())) < MIN_INPUT {
+    for (start, (x, y)) in setpoint.windows(n).zip(gyro.windows(n)).enumerate().step_by(n / 4) {
+        if x.iter().fold(0f32, |m, v| m.max(v.abs())) < MIN_INPUT || !keep(start, x) {
             continue;
         }
         for (signal, spectrum) in [(x, &mut a), (y, &mut b)] {
@@ -601,7 +651,11 @@ mod tests {
         let r = step_response(&setpoint, &gyro, FS).unwrap();
         let (peak_ms, peak) = r.points.iter().fold((0.0, 0.0), |best, p| if p[1] > best.1 { (p[0], p[1]) } else { best });
         let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
-        eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
+        // У такой системы запас по фазе atan(2ζ / √(√(1 + 4ζ⁴) − 2ζ²)) = 33.3°
+        // на частоте среза 0.914·20 = 18.3 Гц.
+        let margins = r.margins().unwrap();
+        assert!((margins.phase_margin_deg - 33.3).abs() < 6.0 && (margins.crossover_hz - 18.3).abs() < 2.0, "запас {}° на {} Гц", margins.phase_margin_deg, margins.crossover_hz);
+        assert!(margins.error_peak_db > 3.0, "пик ошибки {} дБ", margins.error_peak_db);
         assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
     }
 
@@ -683,6 +737,41 @@ mod tests {
         // При постоянных оборотах различить нельзя.
         let steady = vec![70f32; x.len()];
         assert_eq!(peak_source(&binned_heatmap(&x, &steady, fs).unwrap(), 220.0, fs / 2.0, 150.0), PeakSource::Unclear);
+    }
+
+    #[test]
+    fn step_response_can_be_split_by_stick_rate() {
+        // Плавные движения (до 300 °/с) идут через вялую систему (ζ = 0.8), резкие
+        // (600–800 °/с) — через колебательную (ζ = 0.3): раздельный отклик должен их различить.
+        let (wn, dt) = (std::f64::consts::TAU * 20.0, 1.0 / FS);
+        let mut seed = 5u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f64 / 8_388_608.0
+        };
+        let (mut target, mut y, mut v) = (0f64, 0f64, 0f64);
+        let (mut setpoint, mut gyro) = (Vec::new(), Vec::new());
+        for i in 0..240_000 {
+            let fast = (i / 4000) % 2 == 1; // по 4 с плавных и резких движений поочерёдно
+            if i % 400 == 0 {
+                let sign = if random() > 0.5 { 1.0 } else { -1.0 };
+                target = sign * if fast { 600.0 + 200.0 * random() } else { 300.0 * random() };
+            }
+            let zeta = if fast { 0.3 } else { 0.8 };
+            for _ in 0..10 {
+                let a = wn * wn * (target - y) - 2.0 * zeta * wn * v;
+                v += a * dt / 10.0;
+                y += v * dt / 10.0;
+            }
+            setpoint.push(target as f32);
+            gyro.push(y as f32);
+        }
+        let peak = |r: StepResponse| r.points.iter().map(|p| p[1]).fold(0.0, f64::max);
+        let top = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let slow = peak(step_response_where(&setpoint, &gyro, FS, &|_, x| top(x) < 500.0).unwrap());
+        let fast = peak(step_response_where(&setpoint, &gyro, FS, &|_, x| top(x) >= 500.0).unwrap());
+        assert!(slow < 1.12, "плавные: пик {slow}");
+        assert!(fast > 1.25, "резкие: пик {fast}");
     }
 
     /// Шум без повторов — для проверки задержек и фильтров.

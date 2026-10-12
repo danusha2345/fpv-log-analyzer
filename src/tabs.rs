@@ -3,12 +3,13 @@
 use eframe::egui;
 use egui_plot::{HLine, LineStyle};
 
-use crate::{AXES, Loaded, View, dsp, line, new_plot, row_height, say, swatch, theme};
+use crate::{AXES, Loaded, StepSplit, View, dsp, line, new_plot, row_height, say, swatch, theme};
 
 pub type Steps = [Option<dsp::StepResponse>; 3];
 
 /// Печатает результаты анализа первой записи таблицей — для сверки с другими
 /// программами: `step,ось,мс,отклик`; `bode,ось,Гц,дБ,градусы`;
+/// `margin,ось,частота среза Гц,запас по фазе °,пик ошибки дБ,его частота Гц`;
 /// `delay,ось,мс` (задержка фильтров гироскопа); `psd,сигнал,ось,Гц,дБ`.
 pub fn print_response(loaded: &mut Loaded) {
     for (axis, delay) in AXES.iter().zip(loaded.delays()) {
@@ -31,6 +32,9 @@ pub fn print_response(loaded: &mut Loaded) {
         for p in step.iter().flat_map(|s| &s.bode) {
             say(format_args!("bode,{axis},{:.3},{:.3},{:.2}", p[0], p[1], p[2]));
         }
+        if let Some(m) = step.as_ref().and_then(dsp::StepResponse::margins) {
+            say(format_args!("margin,{axis},{:.2},{:.1},{:.2},{:.2}", m.crossover_hz, m.phase_margin_deg, m.error_peak_db, m.error_peak_hz));
+        }
     }
 }
 
@@ -48,34 +52,103 @@ fn captioned_row_height(ui: &egui::Ui) -> f32 {
     row_height(ui, 3) - ui.text_style_height(&egui::TextStyle::Body) - ui.spacing().item_spacing.y
 }
 
+/// Отклики по группам окон: `(название группы, отклики по осям)`.
+pub type SplitSteps = Vec<(String, Steps)>;
+
+/// Считает отклик отдельно по группам окон: по скорости движения стиков
+/// (плавные и резкие) или по газу (три равные по времени трети).
+fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
+    if loaded.split_steps.as_ref().is_some_and(|(range, (s, _))| *range == loaded.range && *s == split) {
+        return;
+    }
+    const FAST: f32 = 500.0; // °/с, как в PID-Analyzer
+    let ((lo, hi), fs) = (loaded.range, loaded.sample_rate);
+    let (setpoint, gyro) = (loaded.axis_cols("setpoint"), loaded.axis_cols("gyroADC"));
+    let per_axis = |keep: &dyn Fn(usize, &[f32]) -> bool| [0, 1, 2].map(|a| dsp::step_response_where(&setpoint[a]?[lo..hi], &gyro[a]?[lo..hi], fs, keep));
+    let top = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let groups: SplitSteps = match (split, loaded.throttle_pct()) {
+        (StepSplit::Rate, _) => vec![
+            (format!("плавные движения, до {FAST:.0} °/с"), per_axis(&|_, x| top(x) < FAST)),
+            (format!("резкие, от {FAST:.0} °/с"), per_axis(&|_, x| top(x) >= FAST)),
+        ],
+        (StepSplit::Throttle, Some(throttle)) => {
+            let throttle = &throttle[lo..hi];
+            let mut sorted = throttle.to_vec();
+            sorted.sort_unstable_by(f32::total_cmp);
+            let (low, high) = (sorted[sorted.len() / 3], sorted[sorted.len() * 2 / 3]);
+            // Газ окна — средний за его 2 с.
+            let window = (fs * 2.0) as usize;
+            let mean = |start: usize| throttle[start..(start + window).min(throttle.len())].iter().sum::<f32>() / window as f32;
+            vec![
+                (format!("малый газ, до {low:.0} %"), per_axis(&|start, _| mean(start) < low)),
+                (format!("средний газ, {low:.0}–{high:.0} %"), per_axis(&|start, _| (low..high).contains(&mean(start)))),
+                (format!("большой газ, от {high:.0} %"), per_axis(&|start, _| mean(start) >= high)),
+            ]
+        }
+        _ => Vec::new(),
+    };
+    loaded.split_steps = Some((loaded.range, (split, groups)));
+}
+
 /// Отклик на ступеньку и частотная характеристика по осям, по видимому на кривых участку.
-pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>) {
+pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
+    ui.horizontal(|ui| {
+        ui.label("Отклик");
+        ui.selectable_value(&mut view.step_split, StepSplit::None, "Общий");
+        ui.selectable_value(&mut view.step_split, StepSplit::Rate, "По скорости стиков").on_hover_text("Отдельно для плавных и резких движений. Расходятся — настройка ведёт себя по-разному на малых и больших скоростях.");
+        ui.selectable_value(&mut view.step_split, StepSplit::Throttle, "По газу").on_hover_text("Отдельно для малого, среднего и большого газа. Расходятся — усиление контура плывёт с газом (смотрите TPA).");
+    });
     ensure_steps(loaded);
+    ensure_split_steps(loaded, view.step_split);
     let steps = &loaded.steps.as_ref().unwrap().1;
+    let groups = &loaded.split_steps.as_ref().unwrap().1.1;
     let compared = compare.map(|c| {
         ensure_steps(c);
         &c.steps.as_ref().unwrap().1
     });
     let height = captioned_row_height(ui);
     for (a, axis) in AXES.iter().enumerate() {
-        let Some(step) = &steps[a] else {
+        // Кривые оси: общий отклик либо отклики по группам, каждая своим цветом.
+        let curves: Vec<(egui::Color32, &str, &dsp::StepResponse)> = if groups.is_empty() {
+            steps[a].iter().map(|s| (theme::series_color("gyroADC"), "gyroADC", s)).collect()
+        } else {
+            groups.iter().enumerate().filter_map(|(i, (name, by_axis))| Some((theme::nth_series(i), name.as_str(), by_axis[a].as_ref()?))).collect()
+        };
+        if curves.is_empty() {
             ui.colored_label(theme::MUTED, format!("{axis}: отклик не получен. Нужно не меньше 15 с движений стиков быстрее 20 °/с на выбранном участке и поля setpoint и gyroADC в логе."));
             ui.add_space(height);
             continue;
-        };
-        let other = compared.and_then(|c| c[a].as_ref());
-        let peak = step.points.iter().map(|p| p[1]).fold(0.0, f64::max);
-        let half = step.points.iter().find(|p| p[1] >= 0.5).map_or(f64::NAN, |p| p[0]);
-        let band = step.bandwidth_hz().map_or("выше 100 Гц или не определена".into(), |hz| format!("{hz:.0} Гц"));
-        ui.horizontal(|ui| {
+        }
+        ui.horizontal_wrapped(|ui| {
             ui.label(*axis);
-            ui.colored_label(theme::MUTED, format!("окон {}, пик {peak:.2}, половина задания через {half:.0} мс, полоса по уровню −3 дБ: {band}", step.windows));
+            if groups.is_empty() {
+                let step = curves[0].2;
+                let peak = step.points.iter().map(|p| p[1]).fold(0.0, f64::max);
+                let half = step.points.iter().find(|p| p[1] >= 0.5).map_or(f64::NAN, |p| p[0]);
+                let band = step.bandwidth_hz().map_or("выше 100 Гц или не определена".into(), |hz| format!("{hz:.0} Гц"));
+                let margin = step.margins().map_or("не определён".into(), |m| format!("{:.0}° на {:.0} Гц, пик ошибки {:+.0} дБ на {:.0} Гц", m.phase_margin_deg, m.crossover_hz, m.error_peak_db, m.error_peak_hz));
+                ui.colored_label(theme::MUTED, format!("окон {}, пик {peak:.2}, половина задания через {half:.0} мс, полоса по −3 дБ: {band}, запас по фазе: {margin}", step.windows)).on_hover_text(
+                    "Запас по фазе — насколько контур далёк от раскачки: меньше 45° — близко. Пик ошибки — во сколько раз контур усиливает рассогласование на худшей частоте. Оба считаются по измеренной связи задания и гироскопа в предположении, что feedforward мал.",
+                );
+            } else {
+                for (i, (name, by_axis)) in groups.iter().enumerate() {
+                    crate::swatch_color(ui, theme::nth_series(i));
+                    match &by_axis[a] {
+                        Some(step) => ui.colored_label(theme::MUTED, format!("{name}: пик {:.2}, окон {}", step.points.iter().map(|p| p[1]).fold(0.0, f64::max), step.windows)),
+                        None => ui.colored_label(theme::MUTED, format!("{name}: мало данных")),
+                    };
+                }
+            }
         });
+        let other = compared.filter(|_| groups.is_empty()).and_then(|c| c[a].as_ref());
+        let crossover = curves[0].2.margins().filter(|_| groups.is_empty()).map(|m| m.crossover_hz);
         ui.columns(3, |columns| {
             let x_label = |plot: egui_plot::Plot<'static>, label: &'static str| if a == 2 { plot.x_axis_label(label) } else { plot };
             x_label(new_plot(("step", a)).height(height).link_axis("step", [true, true]).include_y(0.0).include_y(1.2).y_axis_label("отклик"), "время после ступеньки, мс").show(&mut columns[0], |plot| {
                 plot.hline(HLine::new("задание", 1.0).color(theme::MUTED).style(LineStyle::dashed_dense()));
-                plot.line(line("gyroADC", step.points.clone()));
+                for (color, name, step) in &curves {
+                    plot.line(line(name, step.points.clone()).color(*color));
+                }
                 if let Some(other) = other {
                     plot.line(line("gyroADC", other.points.clone()).name("сравнение").style(LineStyle::dashed_loose()));
                 }
@@ -84,9 +157,14 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             for (column, (id, label, value)) in [("gain", "усиление, дБ", 1), ("phase", "фаза, °", 2)].into_iter().enumerate() {
                 let curve = |s: &dsp::StepResponse| s.bode.iter().map(|p| [p[0], p[value]]).collect::<Vec<_>>();
                 x_label(new_plot((id, a)).height(height).link_axis(id, [true, true]).y_axis_label(label), "частота, Гц").show(&mut columns[column + 1], |plot| {
-                    plot.line(line("gyroADC", curve(step)));
+                    for (color, name, step) in &curves {
+                        plot.line(line(name, curve(step)).color(*color));
+                    }
                     if let Some(other) = other {
                         plot.line(line("gyroADC", curve(other)).name("сравнение").style(LineStyle::dashed_loose()));
+                    }
+                    if let Some(hz) = crossover {
+                        plot.vline(egui_plot::VLine::new("частота среза контура", hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
                     }
                 });
             }
@@ -333,7 +411,7 @@ pub struct Overview {
     prop_wash: [Option<dsp::PropWash>; 3],
 }
 
-fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3]) -> Vec<(bool, String)> {
+fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance: &[(&'static str, [Option<f32>; 3])]) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     let nyquist = loaded.sample_rate / 2.0;
     if nyquist < 500.0 {
@@ -436,6 +514,12 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3]) -> Vec<
         if half > 40.0 {
             out.push((false, format!("{}: медленный отклик — половина задания достигается через {half:.0} мс.", AXES[a])));
         }
+        // Запас по фазе выводится из связи «задание → гироскоп»; при заметном feedforward
+        // (больше половины от P) эта связь идёт в обход обратной связи и оценка не годится.
+        let term = |base: &str| balance.iter().find(|(b, _)| *b == base).and_then(|(_, by_axis)| by_axis[a]).unwrap_or(0.0);
+        if let Some(margins) = step.margins().filter(|m| m.phase_margin_deg < 45.0 && term("axisF") < 0.5 * term("axisP")) {
+            out.push((margins.phase_margin_deg < 30.0, format!("{}: запас по фазе {:.0}° на {:.0} Гц — контур близок к раскачке (желательно не меньше 45°).", AXES[a], margins.phase_margin_deg, margins.crossover_hz)));
+        }
     }
     out
 }
@@ -444,10 +528,10 @@ pub fn overview(loaded: &mut Loaded) -> &Overview {
     if loaded.overview.as_ref().is_none_or(|(range, _)| *range != loaded.range) {
         let (lo, hi) = loaded.range;
         let rms = |c: &[f32]| (c[lo..hi].iter().map(|v| (v * v) as f64).sum::<f64>() / (hi - lo).max(1) as f64).sqrt() as f32;
-        let balance = ["axisP", "axisI", "axisD", "axisF"].into_iter().filter(|base| loaded.axis_fields.iter().any(|f| f.base == *base)).map(|base| (base, loaded.axis_cols(base).map(|c| c.map(rms)))).collect();
+        let balance: Vec<(&'static str, [Option<f32>; 3])> = ["axisP", "axisI", "axisD", "axisF"].into_iter().filter(|base| loaded.axis_fields.iter().any(|f| f.base == *base)).map(|base| (base, loaded.axis_cols(base).map(|c| c.map(rms)))).collect();
         let throttle = loaded.throttle_pct();
         let prop_wash = loaded.axis_cols(crate::TRACKING_ERROR).map(|error| dsp::prop_wash(&throttle.as_deref()?[lo..hi], &error?[lo..hi], loaded.sample_rate));
-        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded, &prop_wash), balance, prop_wash }));
+        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded, &prop_wash, &balance), balance, prop_wash }));
     }
     &loaded.overview.as_ref().unwrap().1
 }

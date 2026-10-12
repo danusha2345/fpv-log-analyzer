@@ -50,6 +50,16 @@ const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Settings, "Настройки", "settings"),
 ];
 
+/// Как делить отклик на ступеньку на вкладке «Отклик».
+#[derive(Clone, Copy, PartialEq)]
+enum StepSplit {
+    None,
+    /// Плавные и резкие движения стиков.
+    Rate,
+    /// Малый, средний и большой газ.
+    Throttle,
+}
+
 /// Поле с компонентами по осям; у некоторых (axisD) оси Yaw может не быть.
 struct AxisField {
     base: &'static str,
@@ -122,6 +132,7 @@ struct Loaded {
     trial: ForRange<(Trial, TrialResult)>,
     maps: Option<Maps>,
     steps: ForRange<tabs::Steps>,
+    split_steps: ForRange<(StepSplit, tabs::SplitSteps)>,
     motors: ForRange<tabs::Motors>,
     errors: ForRange<[Option<tabs::TrackingError>; 3]>,
     overview: ForRange<tabs::Overview>,
@@ -217,6 +228,7 @@ impl Loaded {
             trial: None,
             maps: None,
             steps: None,
+            split_steps: None,
             motors: None,
             errors: None,
             overview: None,
@@ -477,8 +489,12 @@ fn filter_marks(log: &bbl::Log) -> Vec<(String, f64)> {
 
 /// Цветная метка серии: кружок цвета линии; подпись рядом пишется обычным цветом текста.
 fn swatch(ui: &mut egui::Ui, name: &str) {
+    swatch_color(ui, theme::series_color(name));
+}
+
+fn swatch_color(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 5.0, theme::series_color(name));
+    ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
 fn line<'a>(name: &str, points: Vec<[f64; 2]>) -> Line<'a> {
@@ -762,6 +778,8 @@ struct View {
     trial_on: bool,
     trial_order: u32,
     trial_hz: u32,
+    /// Деление отклика на вкладке «Отклик».
+    step_split: StepSplit,
     /// Поиск по названию параметра на вкладке «Настройки».
     settings_filter: String,
     /// Показывать только параметры, отличающиеся у лога сравнения.
@@ -842,7 +860,7 @@ impl eframe::App for App {
 
 impl App {
     fn new() -> Self {
-        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
+        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, step_split: StepSplit::None, settings_filter: String::new(), only_different: false };
         Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None }
     }
 
@@ -861,6 +879,11 @@ impl App {
             if self.snapshot_in.is_some() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+        if self.snapshot_in.is_some() {
+            // На снимке для документации не должно быть перекрестья и подсказок от мыши,
+            // случайно оказавшейся над окном.
+            ui.input_mut(|i| i.pointer = Default::default());
         }
         if let Some(frames) = &mut self.snapshot_in {
             // Несколько кадров уходит на расчёт и установку масштаба графиков.
@@ -978,7 +1001,7 @@ impl App {
             Tab::Spectrum => show_spectrum(ui, loaded, compare, view),
             Tab::Heatmap => show_maps(ui, loaded, false, view),
             Tab::Spectrogram => show_maps(ui, loaded, true, view),
-            Tab::Step => tabs::show_step(ui, loaded, compare),
+            Tab::Step => tabs::show_step(ui, loaded, compare, view),
             Tab::Error => tabs::show_error(ui, loaded),
             Tab::Motors => tabs::show_motors(ui, loaded),
             Tab::Settings => tabs::show_settings(ui, loaded, compare.map(|c| &*c), view),
@@ -1025,7 +1048,7 @@ fn main() -> eframe::Result {
     }
     let mut mode = args.next();
     if let Some(tab) = mode.as_deref().and_then(|m| m.strip_suffix("+save")) {
-        (mode, app.snapshot_in) = (Some(tab.to_string()), Some(20));
+        (mode, app.snapshot_in) = (Some(tab.to_string()), Some(60)); // с запасом на разворачивание окна
     }
     // `вкладка@сигнал` — сигнал для карты шума и спектрограммы, например `spectrogram@ошибка`.
     if let Some((tab, signal)) = mode.clone().as_deref().and_then(|m| m.split_once('@')) {
@@ -1066,6 +1089,8 @@ fn main() -> eframe::Result {
         // Варианты вкладок с включёнными переключателями — для снимков окна при проверке.
         Some("rpm") => (app.tab, app.view.by_rpm) = (Tab::Heatmap, true),
         Some("trial") => (app.tab, app.view.trial_on) = (Tab::Spectrum, true),
+        Some("step-rate") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Rate),
+        Some("step-throttle") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Throttle),
         mode => app.tab = TABS.iter().find(|t| Some(t.2) == mode).map_or(app.tab, |t| t.0),
     }
     if let Some(path) = args.next() {
@@ -1073,10 +1098,13 @@ fn main() -> eframe::Result {
     }
     // Приложение лежит в общей ячейке: если первая попытка открыть окно не удалась
     // до его создания, вторая заберёт его оттуда же.
+    let snapshot = app.snapshot_in.is_some();
     let slot = std::rc::Rc::new(std::cell::RefCell::new(Some(app)));
     let run = |renderer| {
         let slot = slot.clone();
-        let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]), renderer, ..Default::default() };
+        // Снимок для документации делается с окна, развёрнутого на весь экран.
+        let viewport = egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]).with_maximized(snapshot);
+        let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
         eframe::run_native(
             "FPV Log Analyzer",
             options,
