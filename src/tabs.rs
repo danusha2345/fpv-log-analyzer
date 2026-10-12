@@ -284,9 +284,11 @@ pub struct Overview {
     pub findings: Vec<(bool, String)>,
     /// СКО составляющих регулятора по осям: `(поле, [Roll, Pitch, Yaw])`.
     balance: Vec<(&'static str, [Option<f32>; 3])>,
+    /// Раскачка после сбросов газа по осям.
+    prop_wash: [Option<dsp::PropWash>; 3],
 }
 
-fn findings(loaded: &mut Loaded) -> Vec<(bool, String)> {
+fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3]) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     let nyquist = loaded.sample_rate / 2.0;
     if nyquist < 500.0 {
@@ -349,6 +351,12 @@ fn findings(loaded: &mut Loaded) -> Vec<(bool, String)> {
         out.push((false, "В логе нет оборотов моторов (eRPM), поэтому нельзя сказать, чьи это пики — моторов или рамы. Обороты пишутся при включённом bidirectional DShot.".into()));
     }
 
+    for (a, wash) in prop_wash.iter().enumerate() {
+        if let Some(wash) = wash.as_ref().filter(|w| w.ratio > 2.0) {
+            out.push((wash.ratio > 4.0, format!("{}: после сбросов газа колебания в полосе 20–90 Гц в {:.1} раза сильнее обычного — prop wash (сбросов газа: {}).", AXES[a], wash.ratio, wash.events)));
+        }
+    }
+
     ensure_steps(loaded);
     for (a, step) in loaded.steps.as_ref().unwrap().1.iter().enumerate() {
         let Some(step) = step else { continue };
@@ -375,7 +383,9 @@ pub fn overview(loaded: &mut Loaded) -> &Overview {
         let (lo, hi) = loaded.range;
         let rms = |c: &[f32]| (c[lo..hi].iter().map(|v| (v * v) as f64).sum::<f64>() / (hi - lo).max(1) as f64).sqrt() as f32;
         let balance = ["axisP", "axisI", "axisD", "axisF"].into_iter().filter(|base| loaded.axis_fields.iter().any(|f| f.base == *base)).map(|base| (base, loaded.axis_cols(base).map(|c| c.map(rms)))).collect();
-        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded), balance }));
+        let throttle = loaded.throttle_pct();
+        let prop_wash = loaded.axis_cols(crate::TRACKING_ERROR).map(|error| dsp::prop_wash(&throttle.as_deref()?[lo..hi], &error?[lo..hi], loaded.sample_rate));
+        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded, &prop_wash), balance, prop_wash }));
     }
     &loaded.overview.as_ref().unwrap().1
 }
@@ -412,6 +422,26 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
                         ui.label(value.map_or("нет".into(), |v| format!("{v:.1}")));
                     }
                     ui.end_row();
+                }
+            });
+        }
+
+        if overview.prop_wash.iter().any(Option::is_some) {
+            ui.add_space(12.0);
+            ui.heading("Сбросы газа (prop wash)");
+            ui.colored_label(theme::MUTED, "Колебания ошибки слежения в полосе 20–90 Гц за 0.3 с после сброса газа — во сколько раз сильнее обычного на этом участке.");
+            egui::Grid::new("prop_wash").num_columns(3).spacing([24.0, 6.0]).show(ui, |ui| {
+                for title in ["Ось", "Сбросов газа", "Колебания после сброса"] {
+                    ui.colored_label(theme::MUTED, title);
+                }
+                ui.end_row();
+                for (axis, wash) in AXES.iter().zip(&overview.prop_wash) {
+                    if let Some(wash) = wash {
+                        ui.label(*axis);
+                        ui.label(wash.events.to_string());
+                        ui.label(format!("в {:.1} раза сильнее обычного", wash.ratio));
+                        ui.end_row();
+                    }
                 }
             });
         }

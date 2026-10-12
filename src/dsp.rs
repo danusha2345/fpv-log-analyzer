@@ -374,6 +374,59 @@ pub fn delay_ms(raw: &[f32], filtered: &[f32], fs: f64) -> Option<f64> {
     (den > 0.0).then(|| (-num / (std::f64::consts::TAU * den) * 1000.0).max(0.0))
 }
 
+/// Раскачка после сбросов газа (prop wash) по одной оси.
+pub struct PropWash {
+    /// Сколько сбросов газа найдено.
+    pub events: usize,
+    /// Во сколько раз колебания в полосе 20–90 Гц за 0.3 с после сброса сильнее,
+    /// чем обычно на этом участке (по амплитуде; 1 — раскачки нет).
+    pub ratio: f64,
+}
+
+/// Ищет сбросы газа (не меньше 15 % за 0.2 с) и сравнивает колебания ошибки
+/// слежения в полосе 20–90 Гц сразу после них с обычным уровнем на участке.
+/// Нужны хотя бы три сброса и запись не реже 250 Гц.
+pub fn prop_wash(throttle_pct: &[f32], error: &[f32], fs: f64) -> Option<PropWash> {
+    const DROP_PCT: f32 = 15.0;
+    let (lookback, window) = ((fs * 0.2) as usize, (fs * 0.3) as usize);
+    let len = throttle_pct.len().min(error.len());
+    if fs < 250.0 || len < window * 20 {
+        return None;
+    }
+    let throttle = lowpass(&throttle_pct[..len], 10.0, 1, fs);
+    // Полоса 20–90 Гц: ниже — сами манёвры, выше — шум моторов.
+    let band: Vec<f32> = lowpass(&error[..len], 90.0, 2, fs).iter().zip(lowpass(&error[..len], 20.0, 2, fs)).map(|(a, b)| a - b).collect();
+    let energy = |from: usize| band[from..from + window].iter().map(|v| (v * v) as f64).sum::<f64>() / window as f64;
+
+    // Конец сброса — момент, когда газ перестал падать; следующий сброс ищется не раньше чем через 0.5 с.
+    let mut events = Vec::new();
+    let mut i = lookback;
+    while i + window < len {
+        if throttle[i - lookback] - throttle[i] >= DROP_PCT && throttle[i + 1] >= throttle[i] {
+            events.push(i);
+            i += (fs * 0.5) as usize;
+        } else {
+            i += 1;
+        }
+    }
+    if events.len() < 3 {
+        return None;
+    }
+    // Обычный уровень — медиана по окнам вне сбросов: отдельные резкие манёвры её не сдвигают.
+    let quiet = |from: usize| events.iter().all(|&e| from + window <= e || from >= e + (fs * 0.5) as usize);
+    let mut usual: Vec<f64> = (0..len - window).step_by(window).filter(|&from| quiet(from)).map(energy).collect();
+    let mut after: Vec<f64> = events.iter().map(|&e| energy(e)).collect();
+    if usual.is_empty() {
+        return None;
+    }
+    let median = |v: &mut Vec<f64>| {
+        let mid = v.len() / 2;
+        *v.select_nth_unstable_by(mid, f64::total_cmp).1
+    };
+    let (after, usual) = (median(&mut after), median(&mut usual));
+    (usual > 0.0).then(|| PropWash { events: events.len(), ratio: (after / usual).sqrt() })
+}
+
 /// Частота среза динамического фильтра нижних частот Betaflight при газе
 /// `throttle` (0..1): формула `dynLpfCutoffFreq` из `pid.c`.
 pub fn dyn_lpf_hz(throttle: f64, min_hz: f64, max_hz: f64, expo: f64) -> f64 {
@@ -508,6 +561,29 @@ mod tests {
         let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
         eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
         assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
+    }
+
+    #[test]
+    fn prop_wash_is_found_after_throttle_drops() {
+        // Газ каждые 5 с за 0.1 с падает с 55 до 20 % и медленно возвращается.
+        let throttle: Vec<f32> = (0..60_000)
+            .map(|i| match i % 5000 {
+                0..2000 => 55.0,
+                p @ 2000..2100 => 55.0 - 35.0 * (p - 2000) as f32 / 100.0,
+                p => (20.0 + (p - 2100) as f32 * 0.02).min(55.0),
+            })
+            .collect();
+        let calm: Vec<f32> = noise(60_000).iter().map(|v| v * 5.0).collect();
+        // После каждого сброса — 0.25 с колебаний на 50 Гц.
+        let shaky: Vec<f32> = calm.iter().enumerate().map(|(i, v)| if (2100..2350).contains(&(i % 5000)) { v + 30.0 * (std::f32::consts::TAU * 50.0 * i as f32 / FS as f32).sin() } else { *v }).collect();
+
+        let found = prop_wash(&throttle, &shaky, FS).unwrap();
+        assert_eq!(found.events, 12);
+        assert!(found.ratio > 4.0, "раскачка сильнее обычного в {} раз", found.ratio);
+        let none = prop_wash(&throttle, &calm, FS).unwrap();
+        assert!((0.7..1.4).contains(&none.ratio), "без раскачки отношение {}", none.ratio);
+        // Без сбросов газа оценивать нечего.
+        assert!(prop_wash(&vec![50.0; 60_000], &calm, FS).is_none());
     }
 
     #[test]
