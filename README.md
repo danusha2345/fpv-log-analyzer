@@ -19,6 +19,8 @@ and Russian: it follows the system language and can be switched from the top bar
 
 ## Run
 
+Download a build for Linux or Windows from the releases page, or build from source:
+
 ```bash
 cargo run --release -- path/to/log.bbl
 ```
@@ -29,9 +31,9 @@ You can also drop a log onto the window or use the "Open log…" button.
 
 | Tab | Contents |
 |---|---|
-| Overview | Findings: whether a peak comes from motors or the frame, prop wash, phase margin, motor saturation; log events |
-| Curves | Signals per Roll / Pitch / Yaw. The time zoom selects the range for the rest of the analysis |
-| Spectrum | Noise before and after filters, filter cutoffs and delay, a trial filter |
+| Overview | Per-axis summary; findings (each links to its tab): whether a peak comes from motors or the frame, prop wash, phase margin, motor saturation; what to enable in the firmware for a better log |
+| Curves | Signals per Roll / Pitch / Yaw. The time zoom selects the range for the rest of the analysis; two cursors measure an interval and its frequency |
+| Spectrum | Noise before and after filters, filter cutoffs and delay, a two-stage trial filter (PT1–PT3, biquad) |
 | Noise map | Noise vs throttle or motor RPM, with filter cutoffs and RPM harmonics overlaid |
 | Spectrogram | Noise over time |
 | Response | Step response, gain and phase, phase margin; split by stick rate or by throttle |
@@ -39,8 +41,9 @@ You can also drop a log onto the window or use the "Open log…" button.
 | Motors | Load, saturation, vibration at each motor's rotation frequency |
 | Settings | Parameters from the log; differences between two logs when comparing |
 
-"Compare with…" overlays a second log on the spectrum and the response;
-"Save snapshot" writes a PNG next to the log.
+"Compare with…" overlays up to three more logs on the spectrum and the response;
+"Save snapshot" writes a PNG next to the log. The language, the last folder and
+the chosen fields are remembered between runs.
 
 ![Curves](docs/screens/en/curves.png)
 ![Spectrum](docs/screens/en/spectrum.png)
@@ -65,3 +68,7 @@ cargo build --release                                   # Linux
 cargo build --release --target x86_64-pc-windows-gnu    # Windows
 cargo test --release
 ```
+
+## License
+
+GPL-3.0-or-later, see [LICENSE](LICENSE). The interface font is IBM Plex Sans (SIL OFL 1.1).
