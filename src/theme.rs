@@ -56,6 +56,7 @@ pub fn series_color(name: &str) -> Color32 {
         "axisF" => SERIES[6],
         "axisSum" => SERIES[5],
         "rcCommand" => MUTED,
+        "ошибка" => SERIES[5],
         "пробный фильтр" => SERIES[6],
         _ => SERIES[index % SERIES.len()],
     }

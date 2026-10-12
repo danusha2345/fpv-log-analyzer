@@ -13,7 +13,9 @@ use egui_plot::{AxisHints, Line, LineStyle, Plot, PlotImage, PlotPoint, PlotPoin
 
 const AXES: [&str; 3] = ["Roll", "Pitch", "Yaw"];
 /// Поля с компонентами по осям дрона: `имя[0..2]` = Roll, Pitch, Yaw.
-const AXIS_BASES: [&str; 9] = ["gyroADC", "gyroUnfilt", "setpoint", "rcCommand", "axisP", "axisI", "axisD", "axisF", "axisSum"];
+const AXIS_BASES: [&str; 10] = ["gyroADC", "gyroUnfilt", "setpoint", TRACKING_ERROR, "rcCommand", "axisP", "axisI", "axisD", "axisF", "axisSum"];
+/// Расчётное поле: задание минус гироскоп.
+const TRACKING_ERROR: &str = "ошибка";
 /// Что включено на кривых сразу после загрузки.
 const DEFAULT_CURVES: [&str; 2] = ["gyroADC", "setpoint"];
 /// Сигналы, для которых строится спектр.
@@ -138,9 +140,23 @@ fn unify_fields(log: &mut bbl::Log) {
     }
 
     // Betaflight 3.x задание не пишет — оно восстанавливается из положения стиков по формуле рейтов.
-    if log.col("setpoint[0]").is_some() || !firmware.starts_with("Betaflight 3.") {
-        return;
+    if log.col("setpoint[0]").is_none() && firmware.starts_with("Betaflight 3.") {
+        restore_setpoint(log);
     }
+
+    // Ошибка слежения — отдельным полем: на её спектрограмме и карте шума бывает видно
+    // то, что в самом гироскопе тонет в манёврах.
+    for a in 0..3 {
+        if let (Some(setpoint), Some(gyro)) = (log.col(&format!("setpoint[{a}]")), log.col(&format!("gyroADC[{a}]"))) {
+            let error = setpoint.iter().zip(gyro).map(|(s, g)| s - g).collect();
+            log.names.push(format!("{TRACKING_ERROR}[{a}]"));
+            log.cols.push(error);
+        }
+    }
+}
+
+/// Задание по осям из положения стиков по старой формуле рейтов Betaflight.
+fn restore_setpoint(log: &mut bbl::Log) {
     for a in 0..3 {
         let number = |name: &str, index: usize| log.header(name).and_then(|v| v.split(',').nth(index)?.trim().parse::<f32>().ok());
         let (rate_name, expo_name) = if a == 2 { ("rcYawRate", "rcYawExpo") } else { ("rcRate", "rcExpo") };
@@ -906,6 +922,11 @@ fn main() -> eframe::Result {
     let mut mode = args.next();
     if let Some(tab) = mode.as_deref().and_then(|m| m.strip_suffix("+save")) {
         (mode, app.snapshot_in) = (Some(tab.to_string()), Some(20));
+    }
+    // `вкладка@сигнал` — сигнал для карты шума и спектрограммы, например `spectrogram@ошибка`.
+    if let Some((tab, signal)) = mode.clone().as_deref().and_then(|m| m.split_once('@')) {
+        mode = Some(tab.to_string());
+        app.view.map_signal = AXIS_BASES.iter().find(|b| **b == signal).copied().unwrap_or(app.view.map_signal);
     }
     if mode.as_deref() == Some("csv") {
         // Третий аргумент — номер записи в файле, по умолчанию первая.
