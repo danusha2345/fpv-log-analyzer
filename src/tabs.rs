@@ -3,7 +3,7 @@
 use eframe::egui;
 use egui_plot::{HLine, LineStyle};
 
-use crate::{AXES, Loaded, StepSplit, View, dsp, line, new_plot, row_height, say, swatch, theme};
+use crate::{AXES, Loaded, StepSplit, Tab, View, dsp, line, new_plot, row_height, say, swatch, theme};
 
 pub type Steps = [Option<dsp::StepResponse>; 3];
 
@@ -404,25 +404,41 @@ fn spectrum_peaks(spectrum: &[[f64; 2]]) -> Vec<(f64, f64)> {
     peaks
 }
 
+/// Автоматическая находка.
+pub struct Finding {
+    pub important: bool,
+    pub text: String,
+    /// Вкладка, где это видно.
+    pub tab: Tab,
+}
+
 /// Сводка по видимому на кривых участку.
 pub struct Overview {
-    /// Автоматические находки: `(важно ли, текст)`.
-    pub findings: Vec<(bool, String)>,
+    pub findings: Vec<Finding>,
+    /// Сводка по осям: `(показатель, [Roll, Pitch, Yaw])`.
+    summary: Vec<(&'static str, [String; 3])>,
+    /// Чего не хватает в записи для полного анализа и как это включить.
+    log_advice: Vec<String>,
     /// СКО составляющих регулятора по осям: `(поле, [Roll, Pitch, Yaw])`.
     balance: Vec<(&'static str, [Option<f32>; 3])>,
     /// Раскачка после сбросов газа по осям.
     prop_wash: [Option<dsp::PropWash>; 3],
 }
 
-fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance: &[(&'static str, [Option<f32>; 3])]) -> Vec<(bool, String)> {
-    let mut out = Vec::new();
+fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance: &[(&'static str, [Option<f32>; 3])]) -> Vec<Finding> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    // Вкладка для каждой находки: после каждой группы проверок список дополняется её вкладкой.
+    let mut tabs: Vec<Tab> = Vec::new();
     let nyquist = loaded.sample_rate / 2.0;
     if nyquist < 500.0 {
         out.push((true, tf!("Лог записан с частотой {:.0} Гц: шум выше {nyquist:.0} Гц в нём не виден, а более высокие частоты отражаются в видимую полосу. Для анализа шума записывайте лог на 2 кГц и выше.", "The log was recorded at {:.0} Hz: noise above {nyquist:.0} Hz is not visible in it, and higher frequencies fold back into the visible band. For noise analysis, log at 2 kHz or higher.", loaded.sample_rate)));
     }
+    tabs.resize(out.len(), Tab::Spectrum);
     if loaded.log.corrupt >= 5 {
         out.push((loaded.log.corrupt >= 50, tf!("В записи {} повреждённых участков: носитель не успевает или в файле остались куски старых данных. Вокруг разрывов графикам доверять нельзя.", "The recording has {} damaged regions: the storage cannot keep up, or the file contains leftovers of old data. Do not trust the charts around the gaps.", loaded.log.corrupt)));
     }
+
+    tabs.resize(out.len(), Tab::Curves);
 
     ensure_motors(loaded);
     let stats = &loaded.motors.as_ref().unwrap().1.stats;
@@ -458,11 +474,25 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
         }
     }
 
+    tabs.resize(out.len(), Tab::Motors);
+
     for (a, ms) in loaded.delays().into_iter().enumerate() {
         if let Some(ms) = ms.filter(|ms| *ms > 4.0) {
             out.push((false, tf!("{}: фильтры гироскопа задерживают сигнал на {ms:.1} мс. Чем больше задержка, тем ниже достижимая резкость настройки.", "{}: gyro filters delay the signal by {ms:.1} ms. The longer the delay, the less sharp a tune can be.", AXES[a])));
         }
     }
+
+    // Полезность D: сколько его энергии лежит выше 100 Гц, где он уже не гасит колебания, а усиливает шум.
+    for (_, by_axis) in loaded.spectra().iter().filter(|(base, _)| *base == "axisD") {
+        for (a, spectrum) in by_axis.iter().enumerate() {
+            let power = |from: f64, to: f64| spectrum.iter().filter(|p| p[0] >= from && p[0] < to).map(|p| 10f64.powf(p[1] / 10.0)).sum::<f64>();
+            let (useful, noise) = (power(5.0, 100.0), power(100.0, f64::INFINITY));
+            if useful + noise > 0.0 && noise / (useful + noise) > 0.6 {
+                out.push((false, tf!("{}: {:.0} % энергии D-составляющей лежит выше 100 Гц — там D не гасит колебания, а усиливает шум и греет моторы. Проверьте фильтры D.", "{}: {:.0} % of the D-term energy lies above 100 Hz — there D amplifies noise and heats the motors instead of damping. Check the D-term filters.", AXES[a], noise / (useful + noise) * 100.0)));
+            }
+        }
+    }
+    tabs.resize(out.len(), Tab::Spectrum);
 
     // Карты «частота × обороты» по осям — чтобы сказать, чей пик: моторов или рамы.
     let (lo, hi) = loaded.range;
@@ -494,15 +524,20 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
         out.push((false, t!("В логе нет оборотов моторов (eRPM), поэтому нельзя сказать, чьи это пики — моторов или рамы. Обороты пишутся при включённом bidirectional DShot.", "The log has no motor speed (eRPM), so it is impossible to tell whether these peaks come from the motors or the frame. Motor speed is logged when bidirectional DShot is on.").into()));
     }
 
+    tabs.resize(out.len(), Tab::Heatmap);
+
     for (a, wash) in prop_wash.iter().enumerate() {
         if let Some(wash) = wash.as_ref().filter(|w| w.ratio > 2.0) {
             out.push((wash.ratio > 4.0, tf!("{}: после сбросов газа колебания в полосе 20–90 Гц в {:.1} раза сильнее обычного — prop wash (сбросов газа: {}).", "{}: after throttle chops, oscillation in the 20–90 Hz band is {:.1} times stronger than usual — prop wash (throttle chops: {}).", AXES[a], wash.ratio, wash.events)));
         }
     }
 
+    tabs.resize(out.len(), Tab::Curves);
+
     ensure_steps(loaded);
     for (a, step) in loaded.steps.as_ref().unwrap().1.iter().enumerate() {
         let Some(step) = step else { continue };
+        let term = |base: &str| balance.iter().find(|(b, _)| *b == base).and_then(|(_, by_axis)| by_axis[a]).unwrap_or(0.0);
         let peak = step.points.iter().map(|p| p[1]).fold(0.0, f64::max);
         let half = step.points.iter().find(|p| p[1] >= 0.5).map_or(f64::NAN, |p| p[0]);
         if peak > 3.0 {
@@ -512,17 +547,78 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
             continue;
         }
         if peak > 1.2 {
-            out.push((true, tf!("{}: перерегулирование {:.0} % в отклике на ступеньку.", "{}: {:.0} % overshoot in the step response.", AXES[a], (peak - 1.0) * 100.0)));
+            // Когда feedforward работает сильнее P, перерегулирование обычно от него.
+            let cause = if term("axisF") > term("axisP") { t!(" Вклад feedforward здесь больше вклада P — скорее всего, перерегулирование от него: убавляйте feedforward, а не P.", " Feedforward contributes more than P here, so the overshoot most likely comes from it: lower feedforward rather than P.") } else { "" };
+            out.push((true, tf!("{}: перерегулирование {:.0} % в отклике на ступеньку.{}", "{}: {:.0} % overshoot in the step response.{}", AXES[a], (peak - 1.0) * 100.0, cause)));
         }
         if half > 40.0 {
             out.push((false, tf!("{}: медленный отклик — половина задания достигается через {half:.0} мс.", "{}: slow response — half of the setpoint is reached in {half:.0} ms.", AXES[a])));
         }
         // Запас по фазе выводится из связи «задание → гироскоп»; при заметном feedforward
         // (больше половины от P) эта связь идёт в обход обратной связи и оценка не годится.
-        let term = |base: &str| balance.iter().find(|(b, _)| *b == base).and_then(|(_, by_axis)| by_axis[a]).unwrap_or(0.0);
         if let Some(margins) = step.margins().filter(|m| m.phase_margin_deg < 45.0 && term("axisF") < 0.5 * term("axisP")) {
             out.push((margins.phase_margin_deg < 30.0, tf!("{}: запас по фазе {:.0}° на {:.0} Гц — контур близок к раскачке (желательно не меньше 45°).", "{}: phase margin {:.0}° at {:.0} Hz — the loop is close to oscillating (at least 45° is desirable).", AXES[a], margins.phase_margin_deg, margins.crossover_hz)));
         }
+    }
+    tabs.resize(out.len(), Tab::Step);
+    out.into_iter().zip(tabs).map(|((important, text), tab)| Finding { important, text, tab }).collect()
+}
+
+/// Сводная таблица показателей по осям.
+fn summary(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3]) -> Vec<(&'static str, [String; 3])> {
+    let (lo, hi) = loaded.range;
+    let none = || "—".to_string();
+    let mut rows = Vec::new();
+    ensure_steps(loaded);
+    let steps = &loaded.steps.as_ref().unwrap().1;
+    if steps.iter().any(Option::is_some) {
+        let of = |f: &dyn Fn(&dsp::StepResponse) -> String| [0, 1, 2].map(|a| steps[a].as_ref().map_or(none(), f));
+        rows.push((t!("Пик отклика на ступеньку", "Step response peak"), of(&|s| format!("{:.2}", s.points.iter().map(|p| p[1]).fold(0.0, f64::max)))));
+        rows.push((t!("Половина задания через", "Half of setpoint in"), of(&|s| s.points.iter().find(|p| p[1] >= 0.5).map_or(none(), |p| tf!("{:.0} мс", "{:.0} ms", p[0])))));
+        rows.push((t!("Запас по фазе", "Phase margin"), of(&|s| s.margins().map_or(none(), |m| tf!("{:.0}° на {:.0} Гц", "{:.0}° at {:.0} Hz", m.phase_margin_deg, m.crossover_hz)))));
+    }
+    let delays = loaded.delays();
+    if delays.iter().any(Option::is_some) {
+        rows.push((t!("Задержка фильтров гироскопа", "Gyro filter delay"), delays.map(|d| d.map_or(none(), |ms| tf!("{:.1} мс", "{:.1} ms", ms)))));
+    }
+    // Шум после фильтров: СКО гироскопа выше 100 Гц, из спектра.
+    if let Some((_, by_axis)) = loaded.spectra().iter().find(|(base, _)| *base == "gyroADC") {
+        let step_hz = by_axis.iter().find_map(|s| Some(s.get(1)?[0] - s[0][0])).unwrap_or(1.0);
+        let noise = |spectrum: &Vec<[f64; 2]>| (spectrum.iter().filter(|p| p[0] >= 100.0).map(|p| 10f64.powf(p[1] / 10.0)).sum::<f64>() * step_hz).sqrt();
+        rows.push((t!("Шум гироскопа выше 100 Гц", "Gyro noise above 100 Hz"), [0, 1, 2].map(|a| if by_axis[a].is_empty() { none() } else { tf!("{:.1} °/с", "{:.1} °/s", noise(&by_axis[a])) })));
+    }
+    let errors = loaded.axis_cols(crate::TRACKING_ERROR);
+    if errors.iter().any(Option::is_some) {
+        let rms = |c: &[f32]| (c[lo..hi].iter().map(|v| (v * v) as f64).sum::<f64>() / (hi - lo).max(1) as f64).sqrt();
+        rows.push((t!("Ошибка слежения, СКО", "Tracking error, RMS"), errors.map(|c| c.map_or(none(), |c| tf!("{:.1} °/с", "{:.1} °/s", rms(c))))));
+    }
+    if prop_wash.iter().any(Option::is_some) {
+        rows.push((t!("Колебания после сброса газа", "Oscillation after a throttle chop"), [0, 1, 2].map(|a| prop_wash[a].as_ref().map_or(none(), |w| format!("×{:.1}", w.ratio)))));
+    }
+    rows
+}
+
+/// Чего не хватает в записи для полного анализа.
+fn log_advice(loaded: &mut Loaded) -> Vec<String> {
+    let mut out = Vec::new();
+    let has = |base: &str| loaded.axis_fields.iter().any(|f| f.base == base);
+    if !has("gyroUnfilt") {
+        out.push(t!("Нет сырого гироскопа (gyroUnfilt): не видно, что убирают фильтры, а задержка фильтров и вибрация по моторам не считаются или занижены. В Betaflight 4.5 и новее сырой гироскоп пишется по умолчанию (проверьте, что поле не отключено в настройках blackbox), в 4.2–4.4 включите debug_mode = GYRO_SCALED.", "No raw gyro (gyroUnfilt): you cannot see what the filters remove, and filter delay and per-motor vibration are missing or too low. Betaflight 4.5 and newer log raw gyro by default (check that the field is not disabled in the blackbox settings); on 4.2–4.4 set debug_mode = GYRO_SCALED.").to_string());
+    }
+    if loaded.log.col("eRPM[0]").is_none() {
+        out.push(t!("Нет оборотов моторов (eRPM): нельзя отличить шум моторов от резонанса рамы, нет карты шума по оборотам и вибрации по моторам. Включите bidirectional DShot.", "No motor speed (eRPM): motor noise cannot be told from frame resonance, and the noise map by RPM and per-motor vibration are unavailable. Enable bidirectional DShot.").to_string());
+    }
+    if !has("setpoint") {
+        out.push(t!("Нет задания (setpoint): отклик, ошибка слежения и prop wash не считаются.", "No setpoint: response, tracking error and prop wash cannot be computed.").to_string());
+    } else {
+        ensure_steps(loaded);
+        if loaded.steps.as_ref().unwrap().1.iter().all(Option::is_none) {
+            out.push(t!("Мало движений стиков для оценки отклика: нужно 15–20 с резких движений по каждой оси.", "Too few stick moves to estimate the response: 15–20 s of sharp moves on each axis are needed.").to_string());
+        }
+    }
+    let (lo, hi) = loaded.range;
+    if loaded.log.time[hi.max(lo + 1) - 1] - loaded.log.time[lo] < 20.0 {
+        out.push(t!("Участок короче 20 с: оценки спектра и отклика грубые.", "The range is shorter than 20 s: spectrum and response estimates are rough.").to_string());
     }
     out
 }
@@ -534,25 +630,55 @@ pub fn overview(loaded: &mut Loaded) -> &Overview {
         let balance: Vec<(&'static str, [Option<f32>; 3])> = ["axisP", "axisI", "axisD", "axisF"].into_iter().filter(|base| loaded.axis_fields.iter().any(|f| f.base == *base)).map(|base| (base, loaded.axis_cols(base).map(|c| c.map(rms)))).collect();
         let throttle = loaded.throttle_pct();
         let prop_wash = loaded.axis_cols(crate::TRACKING_ERROR).map(|error| dsp::prop_wash(&throttle.as_deref()?[lo..hi], &error?[lo..hi], loaded.sample_rate));
-        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded, &prop_wash, &balance), balance, prop_wash }));
+        let (summary, log_advice) = (summary(loaded, &prop_wash), log_advice(loaded));
+        loaded.overview = Some((loaded.range, Overview { findings: findings(loaded, &prop_wash, &balance), summary, log_advice, balance, prop_wash }));
     }
     &loaded.overview.as_ref().unwrap().1
 }
 
-pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
+/// Рисует обзор; возвращает вкладку, на которую пользователь перешёл щелчком по находке.
+pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) -> Option<Tab> {
+    let mut go_to = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         let overview = overview(loaded);
         ui.colored_label(theme::MUTED, t!("Всё считается по участку, выбранному масштабом на вкладке «Кривые». Находки — подсказки, куда смотреть, а не диагноз.", "Everything is computed over the range selected by zooming on the Curves tab. Findings are hints on where to look, not a diagnosis."));
         ui.add_space(6.0);
+        if !overview.summary.is_empty() {
+            ui.heading(t!("Сводка по осям", "Summary per axis"));
+            egui::Grid::new("summary").num_columns(4).striped(true).spacing([32.0, 6.0]).show(ui, |ui| {
+                for title in ["", AXES[0], AXES[1], AXES[2]] {
+                    ui.colored_label(theme::MUTED, title);
+                }
+                ui.end_row();
+                for (name, by_axis) in &overview.summary {
+                    ui.label(*name);
+                    for value in by_axis {
+                        ui.label(value);
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(12.0);
+        }
         ui.heading(t!("Находки", "Findings"));
         if overview.findings.is_empty() {
             ui.label(t!("По проверяемым признакам замечаний нет.", "Nothing to report on the checked criteria."));
         }
-        for (important, text) in &overview.findings {
+        for finding in &overview.findings {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(if *important { theme::WARN } else { theme::MUTED }, if *important { t!("Важно", "Important") } else { t!("Заметка", "Note") });
-                ui.label(text);
+                ui.colored_label(if finding.important { theme::WARN } else { theme::MUTED }, if finding.important { t!("Важно", "Important") } else { t!("Заметка", "Note") });
+                // Текст находки — ссылка на вкладку, где это видно.
+                if ui.link(&finding.text).on_hover_text(t!("Открыть вкладку, где это видно", "Open the tab that shows this")).clicked() {
+                    go_to = Some(finding.tab);
+                }
             });
+        }
+        if !overview.log_advice.is_empty() {
+            ui.add_space(12.0);
+            ui.heading(t!("Что улучшить в записи", "How to improve the recording"));
+            for advice in &overview.log_advice {
+                ui.horizontal_wrapped(|ui| ui.label(advice));
+            }
         }
 
         if !overview.balance.is_empty() {
@@ -607,6 +733,7 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
             });
         }
     });
+    go_to
 }
 
 /// Параметры из заголовка лога; при сравнении — рядом значения второго лога.

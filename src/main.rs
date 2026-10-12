@@ -1046,8 +1046,9 @@ impl App {
 
         let compare = self.compare.as_mut().map(|(_, c)| c);
         let view = &mut self.view;
+        let mut go_to = None;
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Overview => tabs::show_overview(ui, loaded),
+            Tab::Overview => go_to = tabs::show_overview(ui, loaded),
             Tab::Curves => show_curves(ui, loaded),
             Tab::Spectrum => show_spectrum(ui, loaded, compare, view),
             Tab::Heatmap => show_maps(ui, loaded, false, view),
@@ -1057,6 +1058,9 @@ impl App {
             Tab::Motors => tabs::show_motors(ui, loaded),
             Tab::Settings => tabs::show_settings(ui, loaded, compare.map(|c| &*c), view),
         });
+        if let Some(tab) = go_to {
+            self.tab = tab;
+        }
     }
 }
 
@@ -1126,8 +1130,8 @@ fn main() -> eframe::Result {
         for (i, loaded) in app.logs.iter_mut().enumerate() {
             let (duration, frames) = (*loaded.log.time.last().unwrap_or(&0.0), loaded.log.time.len());
             say(format_args!("{}", tf!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", "Record {}: {:.0} s, {:.0} Hz, {} frames, {} recording gaps", i + 1, duration, loaded.sample_rate, frames, loaded.log.corrupt)));
-            for (important, text) in &tabs::overview(loaded).findings {
-                say(format_args!("  [{}] {text}", if *important { t!("важно", "important") } else { t!("заметка", "note") }));
+            for finding in &tabs::overview(loaded).findings {
+                say(format_args!("  [{}] {}", if finding.important { t!("важно", "important") } else { t!("заметка", "note") }, finding.text));
             }
             for (time, event) in &loaded.log.events {
                 say(format_args!("  [{}] {time:.2} {}: {}", t!("событие", "event"), t!("с", "s"), event_text(event)));
