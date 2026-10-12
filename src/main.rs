@@ -75,7 +75,19 @@ struct MapSet {
     top_db: f32,
     /// Правая граница оси X в её единицах (%, с или Гц).
     x_max: f64,
+    /// Линии поверх карты: срезы фильтров и гармоники оборотов.
+    overlays: Vec<Overlay>,
     textures: Vec<Option<egui::TextureHandle>>,
+}
+
+/// Линия поверх карты шума.
+struct Overlay {
+    label: String,
+    /// Точки `[x карты; частота, Гц]`. Там, где линия уходит выше верхней частоты
+    /// карты, стоит `NaN` — в этих местах она прерывается.
+    points: Vec<[f64; 2]>,
+    /// Гармоника оборотов (рисуется пунктиром), а не настройка фильтра (штрих).
+    harmonic: bool,
 }
 
 struct Maps {
@@ -234,6 +246,91 @@ impl Loaded {
         (!cols.is_empty()).then(|| (0..self.log.time.len()).map(|i| cols.iter().map(|c| c[i]).sum::<f32>() * to_hz).collect())
     }
 
+    /// Числа из параметра заголовка лога (`"250,500"` → `[250, 500]`).
+    fn header_numbers(&self, name: &str) -> Vec<f64> {
+        self.log.header(name).map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()
+    }
+
+    /// Линии для карты шума вида `kind`: срезы фильтров из заголовка лога
+    /// и гармоники оборотов моторов. Для D-составляющей берутся её фильтры,
+    /// для остальных сигналов — фильтры гироскопа.
+    fn overlays(&self, signal: &str, kind: MapKind, x_max: f64) -> Vec<Overlay> {
+        let mut out = Vec::new();
+        let f_max = self.sample_rate / 2.0;
+        let stage = if signal == "axisD" { "dterm" } else { "gyro" };
+        let mut horizontal = |label: String, hz: f64| {
+            if hz > 0.0 && hz < f_max {
+                out.push(Overlay { label, points: vec![[0.0, hz], [x_max, hz]], harmonic: false });
+            }
+        };
+        for name in ["lpf1_static_hz", "lpf2_static_hz", "notch_hz"] {
+            for hz in self.header_numbers(&format!("{stage}_{name}")) {
+                horizontal(format!("{stage}_{name} {hz:.0}"), hz);
+            }
+        }
+        if stage == "gyro" {
+            for name in ["dyn_notch_min_hz", "dyn_notch_max_hz", "adrc_gyro_lpf_hz"] {
+                for hz in self.header_numbers(name) {
+                    horizontal(format!("{name} {hz:.0}"), hz);
+                }
+            }
+        }
+
+        // Усреднение сигнала по ~800 участкам времени: линия на спектрограмме не тяжелее самой карты.
+        let over_time = |values: &[f32], to_hz: &dyn Fn(f64) -> f64| -> Vec<[f64; 2]> {
+            let chunk = (values.len() / 800).max(1);
+            values.chunks(chunk).zip(self.log.time.chunks(chunk)).map(|(v, t)| [t[t.len() / 2], to_hz(v.iter().sum::<f32>() as f64 / v.len() as f64)]).collect()
+        };
+        let throttle = self.throttle_pct();
+
+        // Динамический фильтр нижних частот: срез растёт с газом.
+        if let ([min, max], expo, false) = (&self.header_numbers(&format!("{stage}_lpf1_dyn_hz"))[..], self.header_numbers(&format!("{stage}_lpf1_dyn_expo")), matches!(kind, MapKind::Rpm))
+            && *min > 0.0
+            && max > min
+        {
+            let cutoff = |pct: f64| dsp::dyn_lpf_hz((pct / 100.0).clamp(0.0, 1.0), *min, *max, expo.first().copied().unwrap_or(0.0));
+            let points = match (kind, &throttle) {
+                (MapKind::Throttle, _) => (0..=100).map(|pct| [pct as f64, cutoff(pct as f64)]).collect(),
+                (_, Some(throttle)) => over_time(throttle, &cutoff),
+                _ => Vec::new(),
+            };
+            out.push(Overlay { label: format!("{stage}_lpf1_dyn_hz {min:.0}–{max:.0}"), points, harmonic: false });
+        }
+
+        // Гармоники оборотов моторов.
+        if let Some(motor_hz) = self.motor_hz() {
+            for k in 1..=3u32 {
+                let harmonic = |hz: f64| hz * k as f64;
+                let points: Vec<[f64; 2]> = match (kind, &throttle) {
+                    (MapKind::Rpm, _) => {
+                        let end = x_max.min(f_max / k as f64);
+                        vec![[0.0, 0.0], [end, harmonic(end)]]
+                    }
+                    (MapKind::Time, _) => over_time(&motor_hz, &harmonic),
+                    (MapKind::Throttle, Some(throttle)) => {
+                        // Средние обороты на каждом проценте газа.
+                        let mut bins = [(0f64, 0u32); 101];
+                        for (pct, hz) in throttle.iter().zip(&motor_hz) {
+                            let bin = &mut bins[(*pct as usize).min(100)];
+                            *bin = (bin.0 + *hz as f64, bin.1 + 1);
+                        }
+                        // Проценты газа, на которых дрон почти не бывал, пропускаются: среднее по горстке кадров — шум.
+                        let enough = (motor_hz.len() / 500).max(20) as u32;
+                        bins.iter().enumerate().filter(|(_, b)| b.1 >= enough).map(|(pct, b)| [pct as f64, harmonic(b.0 / b.1 as f64)]).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                out.push(Overlay { label: format!("{k}× оборотов"), points, harmonic: true });
+            }
+        }
+        // Выше верхней частоты карты линии не рисуются.
+        for overlay in &mut out {
+            overlay.points.iter_mut().filter(|p| p[1] >= f_max).for_each(|p| p[1] = f64::NAN);
+        }
+        out.retain(|o| o.points.iter().filter(|p| !p[1].is_nan()).count() >= 2);
+        out
+    }
+
     fn spectra(&mut self) -> &Spectra {
         if self.spectra.as_ref().is_none_or(|(range, _)| *range != self.range) {
             let (lo, hi) = self.range;
@@ -277,7 +374,7 @@ impl Loaded {
             let rpm_max = motor_hz.iter().flatten().copied().fold(1.0, f32::max);
             let rpm_pct: Option<Vec<f32>> = motor_hz.map(|hz| hz.iter().map(|v| v / rpm_max * 100.0).collect());
             let binned = |key: &Option<Vec<f32>>| cols.iter().map(|c| dsp::binned_heatmap((*c)?, key.as_deref()?, fs)).collect();
-            let set = |grids: Vec<Option<dsp::Grid>>, x_max: f64| {
+            let set = |grids: Vec<Option<dsp::Grid>>, x_max: f64, kind: MapKind| {
                 // Верх шкалы — не максимум, а уровень, выше которого лишь 0.5 % ячеек:
                 // иначе один удар или краш в логе затемняет всю остальную карту.
                 let mut levels: Vec<f32> = grids.iter().flatten().flat_map(|g| &g.db).copied().filter(|v| !v.is_nan()).collect();
@@ -287,12 +384,12 @@ impl Loaded {
                     let k = levels.len() * 995 / 1000;
                     *levels.select_nth_unstable_by(k, f32::total_cmp).1
                 };
-                MapSet { grids, top_db, x_max, textures: Vec::new() }
+                MapSet { grids, top_db, x_max, overlays: self.overlays(signal, kind, x_max), textures: Vec::new() }
             };
             let sets = [
-                set(binned(&throttle), 100.0),
-                set(cols.iter().map(|c| dsp::spectrogram((*c)?, &self.log.time, fs)).collect(), *self.log.time.last().unwrap()),
-                set(binned(&rpm_pct), rpm_max as f64),
+                set(binned(&throttle), 100.0, MapKind::Throttle),
+                set(cols.iter().map(|c| dsp::spectrogram((*c)?, &self.log.time, fs)).collect(), *self.log.time.last().unwrap(), MapKind::Time),
+                set(binned(&rpm_pct), rpm_max as f64, MapKind::Rpm),
             ];
             self.maps = Some(Maps { signal, range_db: f32::NAN, sets });
         }
@@ -560,7 +657,7 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
     };
     let set = &loaded.maps(ui.ctx(), view.map_signal, view.map_range_db).sets[kind as usize];
     let x_label = ["газ, %", "время, с", "обороты моторов, Гц"][kind as usize];
-    let harmonics = matches!(kind, MapKind::Rpm) && view.harmonics;
+    let overlays = view.overlays;
 
     ui.horizontal(|ui| {
         if !spectrogram && has_rpm {
@@ -579,12 +676,10 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
         ui.add(egui::Slider::new(&mut view.map_range_db, 20.0..=100.0).suffix(" дБ").fixed_decimals(0));
         ui.separator();
         colorbar(ui, set.top_db, view.map_range_db);
-        if matches!(kind, MapKind::Rpm) {
-            ui.separator();
-            ui.checkbox(&mut view.harmonics, "Гармоники оборотов").on_hover_text(
-                "Штриховые линии 1×, 2×, 3× — где должен лежать шум, кратный оборотам моторов. Яркая полоса вдоль такой линии — шум от моторов и пропеллеров; полоса на постоянной частоте — резонанс рамы.",
-            );
-        }
+        ui.separator();
+        ui.checkbox(&mut view.overlays, "Фильтры и обороты").on_hover_text(
+            "Штриховые линии — частоты среза фильтров из настроек лога: шум выше линии фильтр давит. Пунктирные 1×, 2×, 3× — где лежит шум, кратный оборотам моторов (нужна телеметрия оборотов). Яркая полоса вдоль пунктира — моторы и пропеллеры; полоса на постоянной частоте — резонанс рамы.",
+        );
     });
 
     let plot_axis = |ui: &mut egui::Ui, a: usize, height: f32, with_x_label: bool| {
@@ -610,15 +705,19 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
         plot.show(ui, |plot| {
             let center = PlotPoint::new(set.x_max / 2.0, f_max / 2.0);
             plot.image(PlotImage::new(AXES[a], texture.id(), center, [set.x_max as f32, f_max as f32]));
-            if harmonics {
-                for harmonic in 1..=3 {
-                    let name = format!("{harmonic}×");
-                    let end = set.x_max.min(f_max / harmonic as f64);
-                    let points = vec![[0.0, 0.0], [end, end * harmonic as f64]];
-                    plot.line(Line::new(format!("{name} оборотов"), PlotPoints::new(points)).color(theme::INK).style(LineStyle::dashed_dense()).width(1.0));
-                    // Подпись — у верхнего конца линии, внутри поля графика.
-                    let at = PlotPoint::new(end * 0.9, end * 0.9 * harmonic as f64);
-                    plot.text(Text::new(&name, at, format!(" {name}")).color(theme::INK).anchor(egui::Align2::LEFT_CENTER));
+            if overlays {
+                for overlay in &set.overlays {
+                    let style = if overlay.harmonic { LineStyle::Dotted { spacing: 6.0 } } else { LineStyle::dashed_dense() };
+                    // Линия рисуется кусками между разрывами (`NaN`).
+                    for piece in overlay.points.split(|p| p[1].is_nan()).filter(|piece| piece.len() >= 2) {
+                        plot.line(Line::new(&overlay.label, PlotPoints::new(piece.to_vec())).color(theme::INK).style(style).width(1.0));
+                    }
+                    // Подпись — у последней видимой точки в правой части линии, чтобы не упиралась в край.
+                    let visible: Vec<&[f64; 2]> = overlay.points.iter().filter(|p| !p[1].is_nan()).collect();
+                    let [x, hz] = *visible[visible.len() * 9 / 10];
+                    // У левого края подпись идёт вправо от точки, иначе её обрезало бы.
+                    let anchor = if x < set.x_max * 0.3 { egui::Align2::LEFT_BOTTOM } else { egui::Align2::RIGHT_BOTTOM };
+                    plot.text(Text::new(&overlay.label, PlotPoint::new(x, hz), &overlay.label).color(theme::INK).anchor(anchor));
                 }
             }
         });
@@ -653,8 +752,8 @@ struct View {
     map_range_db: f32,
     /// Карта шума по оборотам, а не по газу.
     by_rpm: bool,
-    /// Линии гармоник оборотов на карте по оборотам.
-    harmonics: bool,
+    /// Линии фильтров и гармоник оборотов поверх карт шума.
+    overlays: bool,
     trial_on: bool,
     trial_order: u32,
     trial_hz: u32,
@@ -738,7 +837,7 @@ impl eframe::App for App {
 
 impl App {
     fn new() -> Self {
-        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, harmonics: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
+        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, settings_filter: String::new(), only_different: false };
         Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None }
     }
 

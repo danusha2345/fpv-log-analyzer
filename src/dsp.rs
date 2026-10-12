@@ -374,6 +374,13 @@ pub fn delay_ms(raw: &[f32], filtered: &[f32], fs: f64) -> Option<f64> {
     (den > 0.0).then(|| (-num / (std::f64::consts::TAU * den) * 1000.0).max(0.0))
 }
 
+/// Частота среза динамического фильтра нижних частот Betaflight при газе
+/// `throttle` (0..1): формула `dynLpfCutoffFreq` из `pid.c`.
+pub fn dyn_lpf_hz(throttle: f64, min_hz: f64, max_hz: f64, expo: f64) -> f64 {
+    let curve = throttle * (1.0 - throttle) * expo / 10.0 + throttle;
+    (max_hz - min_hz) * curve + min_hz
+}
+
 /// Фильтр нижних частот PT1 (как в Betaflight), применённый `order` раз подряд:
 /// 1 — PT1, 2 — PT2, 3 — PT3. Частота среза каскада по уровню −3 дБ равна `cutoff_hz`.
 pub fn lowpass(x: &[f32], cutoff_hz: f64, order: u32, fs: f64) -> Vec<f32> {
@@ -501,6 +508,15 @@ mod tests {
         let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
         eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
         assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
+    }
+
+    #[test]
+    fn dyn_lpf_follows_betaflight_formula() {
+        assert_eq!(dyn_lpf_hz(0.0, 250.0, 500.0, 5.0), 250.0);
+        assert_eq!(dyn_lpf_hz(1.0, 250.0, 500.0, 5.0), 500.0);
+        // Посередине кривая с expo 5 выше прямой: 0.5 + 0.5·0.5·0.5 = 0.625.
+        assert_eq!(dyn_lpf_hz(0.5, 250.0, 500.0, 5.0), 250.0 + 250.0 * 0.625);
+        assert_eq!(dyn_lpf_hz(0.5, 250.0, 500.0, 0.0), 375.0);
     }
 
     #[test]
