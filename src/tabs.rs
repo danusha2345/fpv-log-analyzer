@@ -94,7 +94,7 @@ fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
 }
 
 /// Отклик на ступеньку и частотная характеристика по осям, по видимому на кривых участку.
-pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
+pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: &mut [(String, Loaded)], view: &mut View) {
     ui.horizontal(|ui| {
         ui.label(t!("Отклик", "Response"));
         ui.selectable_value(&mut view.step_split, StepSplit::None, t!("Общий", "Overall"));
@@ -105,10 +105,13 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
     ensure_split_steps(loaded, view.step_split);
     let steps = &loaded.steps.as_ref().unwrap().1;
     let groups = &loaded.split_steps.as_ref().unwrap().1.1;
-    let compared = compare.map(|c| {
-        ensure_steps(c);
-        &c.steps.as_ref().unwrap().1
-    });
+    let compared: Vec<(&str, &Steps)> = compare
+        .iter_mut()
+        .map(|(name, c)| {
+            ensure_steps(c);
+            (name.as_str(), &c.steps.as_ref().unwrap().1)
+        })
+        .collect();
     let height = captioned_row_height(ui);
     for (a, axis) in AXES.iter().enumerate() {
         // Кривые оси: общий отклик либо отклики по группам, каждая своим цветом.
@@ -143,7 +146,8 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
                 }
             }
         });
-        let other = compared.filter(|_| groups.is_empty()).and_then(|c| c[a].as_ref());
+        // Логи сравнения накладываются только на общий отклик: с группами линий стало бы слишком много.
+        let others: Vec<(usize, &str, &dsp::StepResponse)> = compared.iter().enumerate().filter(|_| groups.is_empty()).filter_map(|(k, (name, steps))| Some((k, *name, steps[a].as_ref()?))).collect();
         let crossover = curves[0].2.margins().filter(|_| groups.is_empty()).map(|m| m.crossover_hz);
         ui.columns(3, |columns| {
             let x_label = |plot: egui_plot::Plot<'static>, label: &'static str| if a == 2 { plot.x_axis_label(label) } else { plot };
@@ -152,8 +156,8 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
                 for (color, name, step) in &curves {
                     plot.line(line(name, step.points.clone()).color(*color));
                 }
-                if let Some(other) = other {
-                    plot.line(line("gyroADC", other.points.clone()).name(t!("сравнение", "comparison")).style(LineStyle::dashed_loose()));
+                for (k, name, other) in &others {
+                    plot.line(line("gyroADC", other.points.clone()).name(*name).style(crate::compare_style(*k)));
                 }
             });
             // Усиление и фаза — на отдельных графиках: у них разные единицы.
@@ -163,8 +167,8 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
                     for (color, name, step) in &curves {
                         plot.line(line(name, curve(step)).color(*color));
                     }
-                    if let Some(other) = other {
-                        plot.line(line("gyroADC", curve(other)).name(t!("сравнение", "comparison")).style(LineStyle::dashed_loose()));
+                    for (k, name, other) in &others {
+                        plot.line(line("gyroADC", curve(other)).name(*name).style(crate::compare_style(*k)));
                     }
                     if let Some(hz) = crossover {
                         plot.vline(egui_plot::VLine::new(t!("частота среза контура", "loop crossover frequency"), hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
@@ -737,34 +741,34 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) -> Option<Tab> {
 }
 
 /// Параметры из заголовка лога; при сравнении — рядом значения второго лога.
-pub fn show_settings(ui: &mut egui::Ui, loaded: &Loaded, compare: Option<&Loaded>, view: &mut View) {
+pub fn show_settings(ui: &mut egui::Ui, loaded: &Loaded, compare: &[(String, Loaded)], view: &mut View) {
     ui.horizontal(|ui| {
         ui.label(t!("Параметр", "Parameter"));
         ui.add(egui::TextEdit::singleline(&mut view.settings_filter).hint_text(t!("часть названия, например lpf", "part of the name, e.g. lpf")).desired_width(260.0));
-        if compare.is_some() {
+        if !compare.is_empty() {
             ui.checkbox(&mut view.only_different, t!("Только отличающиеся", "Only differing"));
         }
     });
     let needle = view.settings_filter.to_lowercase();
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("settings").num_columns(3).striped(true).spacing([24.0, 4.0]).show(ui, |ui| {
+        egui::Grid::new("settings").num_columns(2 + compare.len()).striped(true).spacing([24.0, 4.0]).show(ui, |ui| {
             ui.colored_label(theme::MUTED, t!("Параметр", "Parameter"));
             ui.colored_label(theme::MUTED, t!("Этот лог", "This log"));
-            if compare.is_some() {
-                ui.colored_label(theme::MUTED, t!("Лог сравнения", "Comparison log"));
+            for (name, _) in compare {
+                ui.colored_label(theme::MUTED, name);
             }
             ui.end_row();
             // Описания полей кадров — служебные, к настройкам дрона не относятся.
             for (name, value) in loaded.log.headers.iter().filter(|(n, _)| !n.starts_with("Field ") && n.to_lowercase().contains(&needle)) {
-                let other = compare.map(|c| c.log.header(name));
-                let differs = other.is_some_and(|o| o != Some(value.as_str()));
-                if view.only_different && compare.is_some() && !differs {
+                let others: Vec<Option<&str>> = compare.iter().map(|(_, c)| c.log.header(name)).collect();
+                let differs = |other: &Option<&str>| *other != Some(value.as_str());
+                if view.only_different && !compare.is_empty() && !others.iter().any(differs) {
                     continue;
                 }
                 ui.label(name);
                 ui.label(value);
-                if let Some(other) = other {
-                    ui.colored_label(if differs { theme::WARN } else { theme::MUTED }, other.unwrap_or(t!("нет в логе", "not in the log")));
+                for other in &others {
+                    ui.colored_label(if differs(other) { theme::WARN } else { theme::MUTED }, other.unwrap_or(t!("нет в логе", "not in the log")));
                 }
                 ui.end_row();
             }

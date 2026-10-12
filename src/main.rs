@@ -300,6 +300,22 @@ impl Loaded {
         (!cols.is_empty()).then(|| (0..self.log.time.len()).map(|i| cols.iter().map(|c| c[i]).sum::<f32>() * to_hz).collect())
     }
 
+    /// Имена полей, включённых на кривых.
+    fn chosen_fields(&self) -> Vec<String> {
+        let axis = self.axis_fields.iter().filter(|f| f.on).map(|f| f.base.to_string());
+        axis.chain(self.other_fields.iter().filter(|f| f.1).map(|f| self.log.names[f.0].clone())).collect()
+    }
+
+    /// Включает на кривых поля с этими именами (те, что есть в логе), остальные выключает.
+    fn choose_fields(&mut self, names: &[String]) {
+        for field in &mut self.axis_fields {
+            field.on = names.iter().any(|n| n == field.base);
+        }
+        for field in &mut self.other_fields {
+            field.1 = names.contains(&self.log.names[field.0]);
+        }
+    }
+
     /// Числа из параметра заголовка лога (`"250,500"` → `[250, 500]`).
     fn header_numbers(&self, name: &str) -> Vec<f64> {
         self.log.header(name).map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()
@@ -689,8 +705,8 @@ fn other_fields_list(ui: &mut egui::Ui, loaded: &mut Loaded, filter: &str) {
             let chosen = loaded.other_fields[k..k + group].iter().filter(|f| f.1).count();
             let title = if chosen > 0 { format!("{} ({chosen}/{group})", base(&names[k])) } else { format!("{} ({group})", base(&names[k])) };
             egui::CollapsingHeader::new(title).id_salt(("fields", base(&names[k]))).show(ui, |ui| {
-                for j in k..k + group {
-                    field(ui, &names[j], &mut loaded.other_fields[j].1);
+                for (name, chosen) in names[k..k + group].iter().zip(&mut loaded.other_fields[k..k + group]) {
+                    field(ui, name, &mut chosen.1);
                 }
             });
         }
@@ -698,7 +714,15 @@ fn other_fields_list(ui: &mut egui::Ui, loaded: &mut Loaded, filter: &str) {
     }
 }
 
-fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
+/// Сколько логов можно наложить для сравнения: больше трёх видов штриха глаз не различает.
+const MAX_COMPARED: usize = 3;
+
+/// Вид линии для лога сравнения с номером `index`.
+fn compare_style(index: usize) -> LineStyle {
+    [LineStyle::dashed_loose(), LineStyle::Dotted { spacing: 5.0 }, LineStyle::dashed_dense()][index % MAX_COMPARED]
+}
+
+fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: &mut [(String, Loaded)], view: &mut View) {
     let (lo, hi) = loaded.range;
     let span = tf!("Участок {:.2}–{:.2} с. Чтобы выбрать другой, измените масштаб на вкладке «Кривые».", "Range {:.2}–{:.2} s. To pick another one, zoom on the Curves tab.", loaded.log.time[lo], loaded.log.time[hi.max(lo + 1) - 1]);
     let nyquist = loaded.sample_rate / 2.0;
@@ -708,7 +732,7 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
     let loaded_trial = loaded.trial_from_log();
     let trial = (view.trial_on && has_raw).then(|| loaded.trial(view.trial).clone());
     let spectra = loaded.spectra();
-    let compared = compare.map(|c| c.spectra());
+    let compared: Vec<(&str, &Spectra)> = compare.iter_mut().map(|(name, c)| (name.as_str(), c.spectra())).collect();
 
     ui.horizontal_wrapped(|ui| {
         for (base, _) in spectra {
@@ -763,8 +787,10 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             if let Some((trial_spectra, _)) = &trial {
                 plot.line(line(TRIAL_FILTER, trial_spectra[a].clone()).name(trial_filter_label()));
             }
-            for (base, by_axis) in compared.into_iter().flatten() {
-                plot.line(line(base, by_axis[a].clone()).name(tf!("{base}, сравнение", "{base}, comparison")).style(LineStyle::dashed_loose()));
+            for (k, (name, spectra)) in compared.iter().enumerate() {
+                for (base, by_axis) in spectra.iter() {
+                    plot.line(line(base, by_axis[a].clone()).name(format!("{base}, {name}")).style(compare_style(k)));
+                }
             }
             // Подписи идут лесенкой, чтобы соседние частоты не накладывались. Высота
             // берётся от самих спектров, а не от границ графика: иначе подписи раздвигали
@@ -942,13 +968,17 @@ struct App {
     path: PathBuf,
     logs: Vec<Loaded>,
     /// Второй лог для сравнения: `(имя файла, лог)`.
-    compare: Option<(String, Loaded)>,
+    compare: Vec<(String, Loaded)>,
     current: usize,
     error: Option<String>,
     /// Сообщение о последнем действии в строке состояния.
     notice: Option<String>,
     /// Заголовок окна, выставленный последним.
     title: String,
+    /// Набор полей на кривых с прошлого запуска.
+    remembered_fields: Option<Vec<String>>,
+    /// Папка, из которой открывали лог в прошлый раз.
+    last_dir: Option<PathBuf>,
     tab: Tab,
     view: View,
     /// Режим «снять и выйти»: через сколько кадров сохранить снимок вкладки и закрыть окно.
@@ -967,15 +997,49 @@ fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-fn pick_log() -> Option<PathBuf> {
-    rfd::FileDialog::new().add_filter("Blackbox", &["bbl", "bfl", "txt"]).pick_file()
+/// Диалог выбора лога; открывается в папке `start` — там, откуда брали прошлый лог.
+fn pick_log(start: Option<&Path>) -> Option<PathBuf> {
+    let dialog = rfd::FileDialog::new().add_filter("Blackbox", &["bbl", "bfl", "txt"]);
+    match start {
+        Some(dir) => dialog.set_directory(dir).pick_file(),
+        None => dialog.pick_file(),
+    }
+}
+
+/// Основные настройки дрона из заголовка лога: `(подпись, значение)`. Показаны в нижней
+/// панели, чтобы по сохранённому снимку было видно, на какой настройке он снят.
+fn tune_summary(log: &bbl::Log) -> Vec<(&'static str, String)> {
+    const KEYS: [(&str, &str); 14] = [
+        ("Craft name", "Craft"),
+        ("rollPID", "Roll PID"),
+        ("pitchPID", "Pitch PID"),
+        ("yawPID", "Yaw PID"),
+        ("gyro_lpf1_static_hz", "gyro LPF1"),
+        ("gyro_lpf1_dyn_hz", "gyro LPF1 dyn"),
+        ("gyro_lpf2_static_hz", "gyro LPF2"),
+        ("dterm_lpf1_static_hz", "D LPF1"),
+        ("dterm_lpf1_dyn_hz", "D LPF1 dyn"),
+        ("dterm_lpf2_static_hz", "D LPF2"),
+        ("dyn_notch_count", "dyn notch"),
+        ("rpm_filter_harmonics", "RPM harmonics"),
+        ("rates", "rates"),
+        ("rc_rates", "RC rates"),
+    ];
+    // Выключенное (нули) и пустое не показываются.
+    let set = |value: &str| !value.trim().is_empty() && value.split(',').any(|v| v.trim() != "0");
+    KEYS.iter().filter_map(|(key, label)| Some((*label, log.header(key).filter(|v| set(v))?.trim().to_string()))).collect()
 }
 
 impl App {
     fn open(&mut self, path: &Path) {
         (self.error, self.notice) = (None, None);
         match load(path) {
-            Ok(logs) => {
+            Ok(mut logs) => {
+                // Набор полей на кривых переносится с прошлого лога (или прошлого запуска).
+                let chosen = self.logs.get(self.current).map(Loaded::chosen_fields).or_else(|| self.remembered_fields.clone());
+                if let Some(chosen) = &chosen {
+                    logs.iter_mut().for_each(|log| log.choose_fields(chosen));
+                }
                 self.path = path.to_path_buf();
                 self.logs = logs;
                 self.current = 0;
@@ -988,7 +1052,7 @@ impl App {
     fn open_compare(&mut self, path: &Path) {
         (self.error, self.notice) = (None, None);
         match load(path) {
-            Ok(mut logs) => self.compare = Some((file_name(path), logs.swap_remove(0))),
+            Ok(mut logs) => self.compare.push((file_name(path), logs.swap_remove(0))),
             Err(e) => self.error = Some(e),
         }
     }
@@ -1010,12 +1074,44 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
     }
+
+    /// Запоминает между запусками язык, папку с логами, набор полей на кривых и настройки карт.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("language", if i18n::english() { "en" } else { "ru" }.into());
+        if let Some(dir) = &self.last_dir {
+            storage.set_string("last_dir", dir.to_string_lossy().into_owned());
+        }
+        if let Some(log) = self.logs.get(self.current) {
+            storage.set_string("curve_fields", log.chosen_fields().join("\n"));
+        }
+        storage.set_string("map_range_db", self.view.map_range_db.to_string());
+        storage.set_string("overlays", self.view.overlays.to_string());
+    }
 }
 
 impl App {
+    /// Восстанавливает запомненное в прошлый раз (см. [`eframe::App::save`]).
+    fn restore(&mut self, storage: &dyn eframe::Storage) {
+        // Язык, заданный явно через FPV_LANG, важнее запомненного.
+        if let (Some(language), Err(_)) = (storage.get_string("language"), std::env::var("FPV_LANG")) {
+            i18n::set_english(language != "ru");
+        }
+        self.last_dir = storage.get_string("last_dir").map(PathBuf::from).filter(|dir| dir.is_dir());
+        self.remembered_fields = storage.get_string("curve_fields").map(|names| names.lines().map(str::to_string).collect());
+        if let (Some(fields), true) = (&self.remembered_fields, self.snapshot_in.is_none()) {
+            self.logs.iter_mut().for_each(|log| log.choose_fields(fields));
+        }
+        if let Some(range) = storage.get_string("map_range_db").and_then(|v| v.parse::<f32>().ok()) {
+            self.view.map_range_db = range.clamp(20.0, 100.0);
+        }
+        if let Some(overlays) = storage.get_string("overlays").and_then(|v| v.parse().ok()) {
+            self.view.overlays = overlays;
+        }
+    }
+
     fn new() -> Self {
         let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial: [(1, 100), (0, 200)], step_split: StepSplit::None, field_filter: String::new(), settings_filter: String::new(), only_different: false };
-        Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, title: String::new(), tab: Tab::Overview, view, snapshot_in: None }
+        Self { path: PathBuf::new(), logs: Vec::new(), compare: Vec::new(), current: 0, error: None, notice: None, title: String::new(), remembered_fields: None, last_dir: None, tab: Tab::Overview, view, snapshot_in: None }
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -1059,19 +1155,20 @@ impl App {
             // С переносом: при выборе записи и в узком окне вкладки уходят на вторую строку, а не за край.
             ui.horizontal_wrapped(|ui| {
                 if ui.button(t!("Открыть лог…", "Open log…")).clicked()
-                    && let Some(path) = pick_log()
+                    && let Some(path) = pick_log(self.last_dir.as_deref())
                 {
+                    self.last_dir = path.parent().map(Path::to_path_buf);
                     self.open(&path);
                 }
                 if !self.logs.is_empty() {
-                    if self.compare.is_some() {
-                        if ui.button(t!("Убрать сравнение", "Remove comparison")).clicked() {
-                            self.compare = None;
-                        }
-                    } else if ui.button(t!("Сравнить с…", "Compare with…")).clicked()
-                        && let Some(path) = pick_log()
+                    if self.compare.len() < MAX_COMPARED
+                        && ui.button(t!("Сравнить с…", "Compare with…")).on_hover_text(t!("Наложить ещё один лог на спектр и отклик (до трёх).", "Overlay another log on the spectrum and the response (up to three).")).clicked()
+                        && let Some(path) = pick_log(self.last_dir.as_deref())
                     {
                         self.open_compare(&path);
+                    }
+                    if !self.compare.is_empty() && ui.button(t!("Убрать сравнение", "Remove comparison")).clicked() {
+                        self.compare.clear();
                     }
                     if ui.button(t!("Сохранить снимок", "Save snapshot")).clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -1104,6 +1201,13 @@ impl App {
 
         let mut whole_log = false;
         egui::Panel::bottom("status").show(ui, |ui| {
+            if let (None, Some(l)) = (&self.error, self.logs.get(self.current)) {
+                ui.horizontal_wrapped(|ui| {
+                    for (label, value) in tune_summary(&l.log) {
+                        fact(ui, label, value);
+                    }
+                });
+            }
             ui.horizontal(|ui| match (&self.error, self.logs.get(self.current)) {
                 (Some(e), _) => {
                     ui.colored_label(ui.visuals().error_fg_color, e);
@@ -1119,8 +1223,8 @@ impl App {
                         fact(ui, t!("Анализируется участок", "Analysing range"), tf!("{:.2}–{:.2} с", "{:.2}–{:.2} s", l.log.time[lo], l.log.time[hi.max(lo + 1) - 1]));
                         whole_log = ui.button(t!("Весь лог", "Whole log")).clicked();
                     }
-                    if let Some((name, _)) = &self.compare {
-                        fact(ui, t!("Сравнение, штриховые линии", "Comparison (dashed lines)"), name.clone());
+                    for (k, (name, _)) in self.compare.iter().enumerate() {
+                        fact(ui, [t!("Сравнение, штрих", "Comparison, dashed"), t!("Сравнение, пунктир", "Comparison, dotted"), t!("Сравнение, мелкий штрих", "Comparison, fine dashes")][k], name.clone());
                     }
                     if let Some(notice) = &self.notice {
                         ui.label(notice);
@@ -1159,7 +1263,7 @@ impl App {
             });
         }
 
-        let compare = self.compare.as_mut().map(|(_, c)| c);
+        let compare = &mut self.compare[..];
         let view = &mut self.view;
         let mut go_to = None;
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
@@ -1171,7 +1275,7 @@ impl App {
             Tab::Step => tabs::show_step(ui, loaded, compare, view),
             Tab::Error => tabs::show_error(ui, loaded),
             Tab::Motors => tabs::show_motors(ui, loaded),
-            Tab::Settings => tabs::show_settings(ui, loaded, compare.map(|c| &*c), view),
+            Tab::Settings => tabs::show_settings(ui, loaded, compare, view),
         });
         if let Some(tab) = go_to {
             self.tab = tab;
@@ -1260,13 +1364,19 @@ fn main() -> eframe::Result {
     match mode.as_deref() {
         // Варианты вкладок с включёнными переключателями — для снимков окна при проверке.
         Some("rpm") => (app.tab, app.view.by_rpm) = (Tab::Heatmap, true),
-        Some("trial") => (app.tab, app.view.trial_on) = (Tab::Spectrum, true),
+        Some("trial") => {
+            (app.tab, app.view.trial_on) = (Tab::Spectrum, true);
+            app.view.trial = app.logs.first().and_then(Loaded::trial_from_log).unwrap_or(app.view.trial);
+        }
         Some("step-rate") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Rate),
         Some("step-throttle") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Throttle),
         mode => app.tab = TABS.iter().find(|t| Some(t.3) == mode).map_or(app.tab, |t| t.0),
     }
     if let Some(path) = args.next() {
         app.open_compare(Path::new(&path));
+        for path in args.by_ref().take(MAX_COMPARED - 1) {
+            app.open_compare(Path::new(&path));
+        }
     }
     // Приложение лежит в общей ячейке: если первая попытка открыть окно не удалась
     // до его создания, вторая заберёт его оттуда же.
@@ -1282,7 +1392,12 @@ fn main() -> eframe::Result {
             options,
             Box::new(move |cc| {
                 theme::apply(&cc.egui_ctx);
-                Ok(Box::new(slot.borrow_mut().take().expect("приложение создаётся один раз")))
+                let mut app = slot.borrow_mut().take().expect("приложение создаётся один раз");
+                // Снимки для документации не должны зависеть от того, что запомнено у пользователя.
+                if let (Some(storage), false) = (cc.storage, snapshot) {
+                    app.restore(storage);
+                }
+                Ok(Box::new(app))
             }),
         )
     };
