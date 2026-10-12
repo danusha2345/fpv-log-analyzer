@@ -19,7 +19,7 @@ GRAM / TON `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
 
 ## Запуск
 
-Готовые сборки для Linux и Windows — на странице релизов. Либо из исходников:
+Готовые сборки для Linux и Windows — на [странице релизов](https://github.com/danusha2345/fpv-log-analyzer/releases). Либо из исходников:
 
 ```bash
 cargo run --release -- путь/к/логу.bbl

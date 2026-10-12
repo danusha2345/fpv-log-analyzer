@@ -19,7 +19,7 @@ and Russian: it follows the system language and can be switched from the top bar
 
 ## Run
 
-Download a build for Linux or Windows from the releases page, or build from source:
+Download a build for Linux or Windows from the [releases page](https://github.com/danusha2345/fpv-log-analyzer/releases), or build from source:
 
 ```bash
 cargo run --release -- path/to/log.bbl
