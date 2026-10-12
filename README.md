@@ -3,9 +3,9 @@
 **English** · [Русский](README.ru.md)
 
 **Support the project:**
-[Boosty](https://boosty.to/danusha/donate) ·
-USDT (TRON / TRC-20) `THyBqiMTWQ7kUH6vVBEdboL7yGLj5mCSrX` ·
-GRAM / TON `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
+[Boosty](https://boosty.to/danusha/donate) 
+· USDT (TRON / TRC-20) `THyBqiMTWQ7kUH6vVBEdboL7yGLj5mCSrX`
+· GRAM / TON `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
 
 A blackbox log analyzer for FPV drones: charts that help you find the cause of
 a problem — noise, filters, response, motors. Not an autotuner. Linux and
