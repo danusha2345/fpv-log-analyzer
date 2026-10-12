@@ -154,6 +154,10 @@ struct Loaded {
     range: (usize, usize),
     /// Просьба вернуть на кривых масштаб «весь лог».
     reset_zoom: bool,
+    /// Измерительные курсоры A и B на кривых, время в секундах.
+    cursors: [Option<f64>; 2],
+    /// Просьба показать на кривых этот участок времени.
+    zoom_to: Option<(f64, f64)>,
     spectra: ForRange<Spectra>,
     /// Задержка `gyroADC` относительно `gyroUnfilt` по осям, мс.
     delays: ForRange<[Option<f64>; 3]>,
@@ -252,6 +256,8 @@ impl Loaded {
             sample_rate: log.sample_rate(),
             range: (0, log.time.len()),
             reset_zoom: false,
+            cursors: [None; 2],
+            zoom_to: None,
             axis_fields,
             other_fields,
             spectra: None,
@@ -550,11 +556,38 @@ fn per_axis_ms(values: [Option<f64>; 3]) -> String {
 }
 
 fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(
+            theme::MUTED,
+            t!(
+                "Масштаб — Ctrl + колесо или рамка правой кнопкой, двойной щелчок — весь лог. Видимый участок анализируется на остальных вкладках. Щелчок ставит курсор A, Shift + щелчок — курсор B.",
+                "Zoom with Ctrl + wheel or a right-button box; double-click shows the whole log. The visible range is what the other tabs analyse. Click sets cursor A, Shift + click sets cursor B."
+            ),
+        );
+    });
+    if loaded.cursors.iter().any(Option::is_some) {
+        ui.horizontal(|ui| {
+            let mark = |name: &str, at: Option<f64>| at.map_or(String::new(), |t| tf!("{} {:.3} с", "{} {:.3} s", name, t));
+            ui.label(format!("{}  {}", mark("A", loaded.cursors[0]), mark("B", loaded.cursors[1])));
+            if let [Some(a), Some(b)] = loaded.cursors {
+                let delta = (b - a).abs();
+                // Интервал между курсорами как период: удобно мерить частоту раскачки по двум соседним гребням.
+                ui.label(tf!("Δ {:.1} мс, как период — {:.1} Гц", "Δ {:.1} ms, as a period — {:.1} Hz", delta * 1000.0, 1.0 / delta.max(1e-6)));
+                if ui.button(t!("Показать участок A–B", "Show range A–B")).clicked() {
+                    loaded.zoom_to = Some((a.min(b), a.max(b)));
+                }
+            }
+            if ui.button(t!("Убрать курсоры", "Clear cursors")).clicked() {
+                loaded.cursors = [None; 2];
+            }
+        });
+    }
+
     let log = &loaded.log;
     let others: Vec<usize> = loaded.other_fields.iter().filter(|(_, on)| *on).map(|(i, _)| *i).collect();
     let rows = 3 + !others.is_empty() as usize;
     let height = row_height(ui, rows);
-    let mut range = loaded.range;
+    let (mut range, mut cursors) = (loaded.range, loaded.cursors);
     for row in 0..rows {
         let mut plot = new_plot(("curves", row)).height(height).link_axis("curves", [true, false]).link_cursor("curves", [true, false]).y_axis_label(AXES.get(row).copied().unwrap_or(t!("Прочее", "Other")));
         if row == rows - 1 {
@@ -563,6 +596,14 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
         plot.show(ui, |plot| {
             if loaded.reset_zoom {
                 plot.set_auto_bounds([true, true]);
+            }
+            if let Some((from, to)) = loaded.zoom_to.filter(|(from, to)| to > from) {
+                plot.set_plot_bounds_x(from..=to);
+            }
+            if plot.response().clicked()
+                && let Some(point) = plot.pointer_coordinate()
+            {
+                cursors[plot.ctx().input(|i| i.modifiers.shift) as usize] = Some(point.x);
             }
             if row == 0 {
                 // Пока масштаб автоматический, показываем весь лог: иначе границы
@@ -588,10 +629,51 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
             for (time, event) in &log.events {
                 plot.vline(VLine::new(event_text(event), *time).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
             }
+            for (name, at) in ["A", "B"].into_iter().zip(cursors) {
+                if let Some(at) = at {
+                    plot.vline(VLine::new(name, at).color(theme::ACCENT).width(1.5));
+                    plot.text(Text::new(name, PlotPoint::new(at, plot.plot_bounds().max()[1]), format!(" {name}")).color(theme::ACCENT).anchor(egui::Align2::LEFT_TOP));
+                }
+            }
         });
     }
-    loaded.range = range;
-    loaded.reset_zoom = false;
+    (loaded.range, loaded.cursors) = (range, cursors);
+    (loaded.reset_zoom, loaded.zoom_to) = (false, None);
+}
+
+/// Список полей без разбивки по осям: поля с общим именем (`debug[0]`…`debug[7]`)
+/// свёрнуты в группу; при поиске показываются подходящие поля россыпью.
+fn other_fields_list(ui: &mut egui::Ui, loaded: &mut Loaded, filter: &str) {
+    let base = |name: &str| name.split('[').next().unwrap_or(name).to_string();
+    let names: Vec<String> = loaded.other_fields.iter().map(|(i, _)| loaded.log.names[*i].clone()).collect();
+    let field = |ui: &mut egui::Ui, name: &str, on: &mut bool| {
+        ui.horizontal(|ui| {
+            swatch(ui, name);
+            ui.checkbox(on, name);
+        });
+    };
+    if !filter.is_empty() {
+        for (k, name) in names.iter().enumerate().filter(|(_, n)| n.to_lowercase().contains(&filter.to_lowercase())) {
+            field(ui, name, &mut loaded.other_fields[k].1);
+        }
+        return;
+    }
+    let mut k = 0;
+    while k < names.len() {
+        let group = names[k..].iter().take_while(|n| base(n) == base(&names[k])).count();
+        if group == 1 {
+            field(ui, &names[k], &mut loaded.other_fields[k].1);
+        } else {
+            let chosen = loaded.other_fields[k..k + group].iter().filter(|f| f.1).count();
+            let title = if chosen > 0 { format!("{} ({chosen}/{group})", base(&names[k])) } else { format!("{} ({group})", base(&names[k])) };
+            egui::CollapsingHeader::new(title).id_salt(("fields", base(&names[k]))).show(ui, |ui| {
+                for j in k..k + group {
+                    field(ui, &names[j], &mut loaded.other_fields[j].1);
+                }
+            });
+        }
+        k += group;
+    }
 }
 
 fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
@@ -813,6 +895,8 @@ struct View {
     trial_hz: u32,
     /// Деление отклика на вкладке «Отклик».
     step_split: StepSplit,
+    /// Поиск по списку полей на вкладке «Кривые».
+    field_filter: String,
     /// Поиск по названию параметра на вкладке «Настройки».
     settings_filter: String,
     /// Показывать только параметры, отличающиеся у лога сравнения.
@@ -895,7 +979,7 @@ impl eframe::App for App {
 
 impl App {
     fn new() -> Self {
-        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, step_split: StepSplit::None, settings_filter: String::new(), only_different: false };
+        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, step_split: StepSplit::None, field_filter: String::new(), settings_filter: String::new(), only_different: false };
         Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, title: String::new(), tab: Tab::Overview, view, snapshot_in: None }
     }
 
@@ -1034,12 +1118,8 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.colored_label(theme::MUTED, t!("Прочее", "Other"));
-                    for (i, on) in &mut loaded.other_fields {
-                        ui.horizontal(|ui| {
-                            swatch(ui, &loaded.log.names[*i]);
-                            ui.checkbox(on, &loaded.log.names[*i]);
-                        });
-                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.view.field_filter).hint_text(t!("поиск поля", "find a field")).desired_width(150.0));
+                    other_fields_list(ui, loaded, &self.view.field_filter);
                 });
             });
         }
@@ -1316,6 +1396,24 @@ mod ui_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cursors_measure_interval_and_zoom_to_it() {
+        let Some(mut harness) = harness() else { return };
+        harness.state_mut().tab = Tab::Curves;
+        harness.state_mut().logs[0].cursors = [Some(10.0), Some(10.05)];
+        harness.run_steps(3);
+        // 50 мс между курсорами — период колебания 20 Гц.
+        assert!(harness.query_by_label_contains("20.0 Гц").is_some());
+        harness.get_by_label("Показать участок A–B").click();
+        harness.run_steps(4);
+        let log = &harness.state().logs[0];
+        let (from, to) = (log.log.time[log.range.0], log.log.time[log.range.1 - 1]);
+        assert!((from - 10.0).abs() < 0.01 && (to - 10.05).abs() < 0.01, "участок {from}–{to}");
+        harness.get_by_label("Убрать курсоры").click();
+        harness.run_steps(2);
+        assert!(harness.query_by_label("Убрать курсоры").is_none());
     }
 
     #[test]

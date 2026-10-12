@@ -24,7 +24,7 @@ pub const MUTED: Color32 = Color32::from_rgb(0x93, 0xA0, 0xB3);
 /// Предупреждения.
 pub const WARN: Color32 = Color32::from_rgb(0xE6, 0x67, 0x67);
 /// Янтарная подсветка выбранного.
-const ACCENT: Color32 = Color32::from_rgb(0xF0, 0xB4, 0x29);
+pub const ACCENT: Color32 = Color32::from_rgb(0xF0, 0xB4, 0x29);
 
 /// Цвета серий в фиксированном порядке (синий, оранжевый, бирюзовый, жёлтый,
 /// пурпурный, зелёный, фиолетовый, красный).
