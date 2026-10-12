@@ -132,8 +132,8 @@ struct Maps {
     sets: [MapSet; 3],
 }
 
-/// Пробный фильтр нижних частот: порядок (PT1..PT3) и частота среза, Гц.
-type Trial = (u32, u32);
+/// Пробный фильтр: две ступени подряд, у каждой вид (номер в `dsp::FILTER_KINDS`, 0 — выключена) и частота среза, Гц.
+type Trial = [(u32, u32); 2];
 /// Спектры и задержки `gyroUnfilt` после пробного фильтра, по осям.
 type TrialResult = ([Vec<[f64; 2]>; 3], [Option<f64>; 3]);
 
@@ -408,10 +408,23 @@ impl Loaded {
         self.delays.as_ref().unwrap().1
     }
 
+    /// Ступени lowpass 1 и 2 гироскопа из настроек лога; `None`, если в логе их нет.
+    /// У динамического lowpass 1 берётся нижняя частота — худший случай по задержке.
+    fn trial_from_log(&self) -> Option<Trial> {
+        // Номера видов фильтра в заголовке лога: 0 — PT1, 1 — BIQUAD, 2 — PT2, 3 — PT3.
+        let kind = |name: &str| [1, 4, 2, 3].get(self.header_numbers(name).first().copied().unwrap_or(0.0) as usize).copied().unwrap_or(1);
+        let hz = |names: &[&str]| names.iter().filter_map(|n| self.header_numbers(n).first().copied()).find(|hz| *hz > 0.0);
+        let stage = |hz: Option<f64>, kind: u32| hz.map_or((0, 100), |hz| (kind, hz as u32));
+        let (first, second) = (hz(&["gyro_lpf1_dyn_hz", "gyro_lpf1_static_hz"]), hz(&["gyro_lpf2_static_hz"]));
+        (first.is_some() || second.is_some()).then(|| [stage(first, kind("gyro_lpf1_type")), stage(second, kind("gyro_lpf2_type"))])
+    }
+
     fn trial(&mut self, trial: Trial) -> &TrialResult {
         if self.trial.as_ref().is_none_or(|(range, (t, _))| *range != self.range || *t != trial) {
             let ((lo, hi), fs) = (self.range, self.sample_rate);
-            let filtered = self.axis_cols("gyroUnfilt").map(|c| c.map(|c| (&c[lo..hi], dsp::lowpass(&c[lo..hi], trial.1 as f64, trial.0, fs))));
+            // Сигнал проходит обе ступени подряд, как lowpass 1 и lowpass 2 гироскопа в прошивке.
+            let chain = |x: &[f32]| trial.iter().fold(x.to_vec(), |x, &(kind, hz)| dsp::apply_filter(&x, kind, hz as f64, fs));
+            let filtered = self.axis_cols("gyroUnfilt").map(|c| c.map(|c| (&c[lo..hi], chain(&c[lo..hi]))));
             let spectra = [0, 1, 2].map(|a| filtered[a].as_ref().map_or(Vec::new(), |(_, f)| dsp::welch_db(f, fs)));
             let delays = [0, 1, 2].map(|a| filtered[a].as_ref().and_then(|(raw, f)| dsp::delay_ms(raw, f, fs)));
             self.trial = Some((self.range, (trial, (spectra, delays))));
@@ -523,7 +536,16 @@ fn filter_marks(log: &bbl::Log) -> Vec<(String, f64)> {
             }
         }
     }
-    marks
+    // По возрастанию частоты; параметры с одной и той же частотой — одной подписью.
+    marks.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut merged: Vec<(String, f64)> = Vec::new();
+    for (name, hz) in marks {
+        match merged.last_mut().filter(|last| last.1 == hz) {
+            Some(last) => last.0 = format!("{}, {name}", last.0),
+            None => merged.push((name, hz)),
+        }
+    }
+    merged
 }
 
 /// Цветная метка серии: кружок цвета линии; подпись рядом пишется обычным цветом текста.
@@ -683,7 +705,8 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
     let marks: Vec<(String, f64)> = filter_marks(&loaded.log).into_iter().filter(|(_, hz)| *hz < nyquist).collect();
     let delays = loaded.delays();
     let has_raw = loaded.axis_fields.iter().any(|f| f.base == "gyroUnfilt");
-    let trial = (view.trial_on && has_raw).then(|| loaded.trial((view.trial_order, view.trial_hz)).clone());
+    let loaded_trial = loaded.trial_from_log();
+    let trial = (view.trial_on && has_raw).then(|| loaded.trial(view.trial).clone());
     let spectra = loaded.spectra();
     let compared = compare.map(|c| c.spectra());
 
@@ -706,12 +729,20 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             ui.separator();
             ui.checkbox(&mut view.trial_on, t!("Пробный фильтр на gyroUnfilt", "Trial filter on gyroUnfilt"));
             if view.trial_on {
-                egui::ComboBox::from_id_salt("trial_order").selected_text(format!("PT{}", view.trial_order)).show_ui(ui, |ui| {
-                    for order in 1..=3 {
-                        ui.selectable_value(&mut view.trial_order, order, format!("PT{order}"));
+                // Две ступени подряд — как lowpass 1 и lowpass 2 гироскопа.
+                for (stage, (kind, hz)) in view.trial.iter_mut().enumerate() {
+                    egui::ComboBox::from_id_salt(("trial_kind", stage)).width(70.0).selected_text(dsp::FILTER_KINDS[*kind as usize]).show_ui(ui, |ui| {
+                        for (k, name) in dsp::FILTER_KINDS.iter().enumerate() {
+                            ui.selectable_value(kind, k as u32, *name);
+                        }
+                    });
+                    if *kind != 0 {
+                        ui.add(egui::Slider::new(hz, 20..=(nyquist as u32).max(21)).suffix(t!(" Гц", " Hz")));
                     }
-                });
-                ui.add(egui::Slider::new(&mut view.trial_hz, 20..=(nyquist as u32).max(21)).suffix(t!(" Гц", " Hz")));
+                }
+                if ui.button(t!("Как в логе", "As in the log")).on_hover_text(t!("Взять виды и частоты lowpass 1 и 2 гироскопа из настроек лога. Сравните кривую с gyroADC: разница — работа notch- и RPM-фильтров.", "Take the gyro lowpass 1 and 2 types and cutoffs from the log settings. Compare the curve with gyroADC: the difference is the work of the notch and RPM filters.")).clicked() {
+                    view.trial = loaded_trial.unwrap_or(view.trial);
+                }
                 if let Some((_, trial_delays)) = &trial {
                     ui.colored_label(theme::MUTED, tf!("задержка с ним: {}", "delay with it: {}", per_axis_ms(*trial_delays)));
                 }
@@ -744,7 +775,12 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             for (k, (name, hz)) in marks.iter().enumerate() {
                 plot.vline(VLine::new(name, *hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
                 if a == 0 && top.is_finite() {
-                    let label = Text::new(name, PlotPoint::new(*hz, top - step * (k % 5) as f64), format!(" {name} {hz:.0}"));
+                    // Длинный список параметров на одной частоте сокращается до первого и счётчика.
+                    let short = match name.split_once(", ") {
+                        Some((first, rest)) => format!("{first} +{}", rest.split(", ").count()),
+                        None => name.clone(),
+                    };
+                    let label = Text::new(name, PlotPoint::new(*hz, top - step * (k % 4) as f64), format!(" {short} {hz:.0}"));
                     plot.text(label.color(theme::MUTED).anchor(egui::Align2::LEFT_TOP));
                 }
             }
@@ -891,8 +927,7 @@ struct View {
     /// Линии фильтров и гармоник оборотов поверх карт шума.
     overlays: bool,
     trial_on: bool,
-    trial_order: u32,
-    trial_hz: u32,
+    trial: Trial,
     /// Деление отклика на вкладке «Отклик».
     step_split: StepSplit,
     /// Поиск по списку полей на вкладке «Кривые».
@@ -979,7 +1014,7 @@ impl eframe::App for App {
 
 impl App {
     fn new() -> Self {
-        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, step_split: StepSplit::None, field_filter: String::new(), settings_filter: String::new(), only_different: false };
+        let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial: [(1, 100), (0, 200)], step_split: StepSplit::None, field_filter: String::new(), settings_filter: String::new(), only_different: false };
         Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, title: String::new(), tab: Tab::Overview, view, snapshot_in: None }
     }
 

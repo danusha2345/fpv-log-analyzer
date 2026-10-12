@@ -596,6 +596,37 @@ pub fn lowpass(x: &[f32], cutoff_hz: f64, order: u32, fs: f64) -> Vec<f32> {
     out
 }
 
+/// Фильтр нижних частот второго порядка (biquad, добротность 0.707 — как BIQUAD в Betaflight).
+pub fn biquad_lowpass(x: &[f32], cutoff_hz: f64, fs: f64) -> Vec<f32> {
+    let omega = std::f64::consts::TAU * cutoff_hz.min(fs * 0.49) / fs;
+    let alpha = omega.sin() / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+    let a0 = 1.0 + alpha;
+    let (b0, b1, b2) = ((1.0 - omega.cos()) / 2.0 / a0, (1.0 - omega.cos()) / a0, (1.0 - omega.cos()) / 2.0 / a0);
+    let (a1, a2) = (-2.0 * omega.cos() / a0, (1.0 - alpha) / a0);
+    let first = x.first().copied().unwrap_or(0.0) as f64;
+    let (mut x1, mut x2, mut y1, mut y2) = (first, first, first, first);
+    x.iter()
+        .map(|&v| {
+            let v = v as f64;
+            let y = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            (x2, x1, y2, y1) = (x1, v, y1, y);
+            y as f32
+        })
+        .collect()
+}
+
+/// Виды фильтров нижних частот Betaflight по порядку для выбора в интерфейсе; 0 — фильтр выключен.
+pub const FILTER_KINDS: [&str; 5] = ["—", "PT1", "PT2", "PT3", "BIQUAD"];
+
+/// Пропускает сигнал через фильтр вида `kind` (номер в [`FILTER_KINDS`]) с частотой среза `cutoff_hz`.
+pub fn apply_filter(x: &[f32], kind: u32, cutoff_hz: f64, fs: f64) -> Vec<f32> {
+    match kind {
+        1..=3 => lowpass(x, cutoff_hz, kind, fs),
+        4 => biquad_lowpass(x, cutoff_hz, fs),
+        _ => x.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +910,9 @@ mod tests {
             let db = 20.0 * (rms(&filtered) / rms(&raw)).log10();
             assert!((db + 3.0).abs() < 0.5, "порядок {order}: {db} дБ");
         }
+        // BIQUAD: −3 дБ на срезе и −12 дБ на удвоенной частоте (второй порядок).
+        let rms = |x: &[f32]| (x[10_000..].iter().map(|v| v * v).sum::<f32>() / 10_000.0).sqrt();
+        let drop = |hz: f32| 20.0 * (rms(&biquad_lowpass(&sine(hz, 20_000), 50.0, FS)) / rms(&sine(hz, 20_000))).log10();
+        assert!((drop(50.0) + 3.0).abs() < 0.3 && (drop(100.0) + 12.3).abs() < 0.8, "biquad: {} и {} дБ", drop(50.0), drop(100.0));
     }
 }
