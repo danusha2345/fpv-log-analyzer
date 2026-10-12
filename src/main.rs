@@ -143,6 +143,10 @@ type ForRange<T> = Option<((usize, usize), T)>;
 struct Loaded {
     log: bbl::Log,
     sample_rate: f64,
+    /// Разрывы записи во всём логе.
+    gaps: dsp::Gaps,
+    /// Сколько первых полей лога записано прошивкой; остальные дописаны для анализа.
+    logged_fields: usize,
     axis_fields: Vec<AxisField>,
     /// Поля без разбивки по осям: `(столбец, включено)`.
     other_fields: Vec<(usize, bool)>,
@@ -229,6 +233,7 @@ fn restore_setpoint(log: &mut bbl::Log) {
 
 impl Loaded {
     fn new(mut log: bbl::Log) -> Self {
+        let logged_fields = log.names.len();
         unify_fields(&mut log);
         let col = |name: String| log.names.iter().position(|n| *n == name);
         let axis_fields: Vec<AxisField> = AXIS_BASES
@@ -242,6 +247,8 @@ impl Loaded {
             .map(|i| (i, false))
             .collect();
         Self {
+            gaps: dsp::Gaps::find(&log.time, log.sample_rate()),
+            logged_fields,
             sample_rate: log.sample_rate(),
             range: (0, log.time.len()),
             reset_zoom: false,
@@ -378,7 +385,7 @@ impl Loaded {
             let spectra = SPECTRUM_BASES
                 .iter()
                 .filter(|&&base| self.axis_fields.iter().any(|f| f.base == base))
-                .map(|&base| (base, self.axis_cols(base).map(|c| c.map_or(Vec::new(), |c| dsp::welch_db(&c[lo..hi], self.sample_rate)))))
+                .map(|&base| (base, self.axis_cols(base).map(|c| c.map_or(Vec::new(), |c| dsp::welch_db_gaps(&c[lo..hi], self.sample_rate, &self.gaps.within(lo, hi))))))
                 .collect();
             self.spectra = Some((self.range, spectra));
         }
@@ -414,7 +421,7 @@ impl Loaded {
             let motor_hz = self.motor_hz();
             let rpm_max = motor_hz.iter().flatten().copied().fold(1.0, f32::max);
             let rpm_pct: Option<Vec<f32>> = motor_hz.map(|hz| hz.iter().map(|v| v / rpm_max * 100.0).collect());
-            let binned = |key: &Option<Vec<f32>>| cols.iter().map(|c| dsp::binned_heatmap((*c)?, key.as_deref()?, fs)).collect();
+            let binned = |key: &Option<Vec<f32>>| cols.iter().map(|c| dsp::binned_heatmap_gaps((*c)?, key.as_deref()?, fs, &self.gaps)).collect();
             let set = |grids: Vec<Option<dsp::Grid>>, x_max: f64, kind: MapKind| {
                 // Верх шкалы — не максимум, а уровень, выше которого лишь 0.5 % ячеек:
                 // иначе один удар или краш в логе затемняет всю остальную карту.
@@ -1062,17 +1069,18 @@ fn say(text: std::fmt::Arguments) {
     }
 }
 
-/// Печатает запись в CSV: время от начала в микросекундах и все поля как в логе.
-fn write_csv(log: &bbl::Log) {
+/// Печатает запись в CSV: время от начала в микросекундах и первые `fields` полей —
+/// те, что записаны в логе (расчётные поля анализа в выгрузку не идут).
+fn write_csv(log: &bbl::Log, fields: usize) {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     // Ошибка записи значит, что читатель закрыл поток (`| head`) — молча прекращаем.
     let mut line = |text: String| writeln!(out, "{text}").is_ok();
-    if !line(format!("time_us,{}", log.names.join(","))) {
+    if !line(format!("time_us,{}", log.names[..fields].join(","))) {
         return;
     }
     for (row, time) in log.time.iter().enumerate() {
-        let values: Vec<String> = log.cols.iter().map(|c| c[row].to_string()).collect();
+        let values: Vec<String> = log.cols[..fields].iter().map(|c| c[row].to_string()).collect();
         if !line(format!("{:.0},{}", time * 1e6, values.join(","))) {
             return;
         }
@@ -1103,7 +1111,7 @@ fn main() -> eframe::Result {
         // Третий аргумент — номер записи в файле, по умолчанию первая.
         let index = args.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
         match app.logs.get(index.wrapping_sub(1)) {
-            Some(loaded) => write_csv(&loaded.log),
+            Some(loaded) => write_csv(&loaded.log, loaded.logged_fields),
             None => eprintln!("{}", app.error.unwrap_or(tf!("В файле нет записи {index}", "The file has no record {index}"))),
         }
         return Ok(());

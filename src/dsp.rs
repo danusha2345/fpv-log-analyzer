@@ -10,6 +10,34 @@ pub struct Grid {
     pub db: Vec<f32>,
 }
 
+/// Разрывы записи: номера отсчётов, перед которыми в логе пропуск. Окно анализа,
+/// накрывающее разрыв, склеивало бы куски из разных моментов полёта — такие окна пропускаются.
+#[derive(Default, Clone)]
+pub struct Gaps(Vec<usize>);
+
+impl Gaps {
+    /// Разрыв — шаг времени больше четырёх обычных.
+    pub fn find(time: &[f64], fs: f64) -> Self {
+        Self(time.windows(2).enumerate().filter(|(_, w)| (w[1] - w[0]) * fs > 4.0).map(|(i, _)| i + 1).collect())
+    }
+
+    /// Разрывы внутри участка `lo..hi`, с номерами от его начала.
+    pub fn within(&self, lo: usize, hi: usize) -> Self {
+        Self(self.0.iter().filter(|&&g| g > lo && g < hi).map(|g| g - lo).collect())
+    }
+
+    /// Есть ли разрыв внутри окна `start..start + len`.
+    pub fn cross(&self, start: usize, len: usize) -> bool {
+        let next = self.0.partition_point(|&g| g <= start);
+        self.0.get(next).is_some_and(|&g| g < start + len)
+    }
+
+    #[cfg(test)]
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+}
+
 fn to_db(power: f32) -> f32 {
     10.0 * power.max(1e-12).log10()
 }
@@ -24,14 +52,19 @@ fn pow2_at_most(limit: f64) -> usize {
 }
 
 /// Спектральная плотность мощности по окнам длиной `n` с шагом `hop`
-/// (окно Ханна, среднее в окне вычтено). Результат — `кадры × (n/2+1)`.
-fn stft(x: &[f32], fs: f64, n: usize, hop: usize) -> Vec<f32> {
+/// (окно Ханна, среднее в окне вычтено). Результат — `кадры × (n/2+1)`;
+/// у окон, накрывающих разрыв записи, все значения `NaN`.
+fn stft(x: &[f32], fs: f64, n: usize, hop: usize, gaps: &Gaps) -> Vec<f32> {
     let window: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos()).collect();
     let scale = (2.0 / (fs * window.iter().map(|&w| (w * w) as f64).sum::<f64>())) as f32;
     let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n);
     let (mut buf, mut out) = (fft.make_input_vec(), fft.make_output_vec());
     let mut power = Vec::new();
-    for seg in x.windows(n).step_by(hop) {
+    for (start, seg) in x.windows(n).enumerate().step_by(hop) {
+        if gaps.cross(start, n) {
+            power.extend(std::iter::repeat_n(f32::NAN, out.len()));
+            continue;
+        }
         let mean = seg.iter().sum::<f32>() / n as f32;
         for ((b, &s), &w) in buf.iter_mut().zip(seg).zip(&window) {
             *b = (s - mean) * w;
@@ -49,19 +82,24 @@ fn stft(x: &[f32], fs: f64, n: usize, hop: usize) -> Vec<f32> {
 /// Спектр по Уэлчу (окно около секунды, перекрытие 50%).
 /// Возвращает точки `[частота, Гц; уровень, дБ]`.
 pub fn welch_db(x: &[f32], fs: f64) -> Vec<[f64; 2]> {
+    welch_db_gaps(x, fs, &Gaps::default())
+}
+
+/// [`welch_db`] для записи с разрывами: окна, накрывающие разрыв, не учитываются.
+pub fn welch_db_gaps(x: &[f32], fs: f64, gaps: &Gaps) -> Vec<[f64; 2]> {
     let n = pow2_at_most(fs.min(x.len() as f64));
     if x.len() < n || fs <= 0.0 {
         return Vec::new();
     }
     let h = n / 2 + 1;
-    let power = stft(x, fs, n, n / 2);
-    if power.iter().all(|&p| p == 0.0) {
-        return Vec::new(); // сигнал постоянен (поле не используется) — рисовать нечего
+    let power = stft(x, fs, n, n / 2, gaps);
+    if power.iter().all(|&p| p == 0.0 || p.is_nan()) {
+        return Vec::new(); // сигнал постоянен (поле не используется) или целых окон нет — рисовать нечего
     }
-    let frames = (power.len() / h) as f32;
+    let frames = power.chunks(h).filter(|frame| !frame[0].is_nan()).count() as f32;
     (1..h) // постоянная составляющая вычтена
         .map(|f| {
-            let mean = power.iter().skip(f).step_by(h).sum::<f32>() / frames;
+            let mean = power.iter().skip(f).step_by(h).filter(|p| !p.is_nan()).sum::<f32>() / frames;
             [f as f64 * fs / n as f64, to_db(mean) as f64]
         })
         .collect()
@@ -77,9 +115,10 @@ fn map_window(len: usize, fs: f64) -> Option<(usize, usize)> {
 /// `time` — время каждого отсчёта: там, где в записи разрыв, столбцы остаются пустыми,
 /// а не сдвигают всё последующее влево.
 pub fn spectrogram(x: &[f32], time: &[f64], fs: f64) -> Option<Grid> {
+    let gaps = Gaps::find(time, fs);
     let (n, hop) = map_window(x.len(), fs)?;
     let h = n / 2 + 1;
-    let frames: Vec<f32> = stft(x, fs, n, hop).into_iter().map(to_db).collect();
+    let frames: Vec<f32> = stft(x, fs, n, hop, &gaps).into_iter().map(|p| if p.is_nan() { p } else { to_db(p) }).collect();
     let centers: Vec<f64> = (0..frames.len() / h).map(|k| time[k * hop + n / 2]).collect();
     let (start, end) = (time[0], time[time.len() - 1]);
     let w = centers.len();
@@ -98,12 +137,21 @@ pub fn spectrogram(x: &[f32], time: &[f64], fs: f64) -> Option<Grid> {
 
 /// Шум в зависимости от режима (газа или оборотов): по `x` — режим в процентах
 /// своего диапазона, 0..100 (100 столбцов), по `y` — частота.
+#[cfg(test)]
 pub fn binned_heatmap(x: &[f32], key_pct: &[f32], fs: f64) -> Option<Grid> {
+    binned_heatmap_gaps(x, key_pct, fs, &Gaps::default())
+}
+
+/// [`binned_heatmap`] для записи с разрывами.
+pub fn binned_heatmap_gaps(x: &[f32], key_pct: &[f32], fs: f64, gaps: &Gaps) -> Option<Grid> {
     const W: usize = 100;
     let (n, hop) = map_window(x.len(), fs)?;
     let h = n / 2 + 1;
     let (mut sum, mut count) = (vec![0f32; W * h], [0u32; W]);
-    for (frame, thr) in stft(x, fs, n, hop).chunks(h).zip(key_pct.windows(n).step_by(hop)) {
+    for (frame, thr) in stft(x, fs, n, hop, gaps).chunks(h).zip(key_pct.windows(n).step_by(hop)) {
+        if frame[0].is_nan() {
+            continue;
+        }
         let bin = ((thr.iter().sum::<f32>() / n as f32) as usize).min(W - 1);
         count[bin] += 1;
         for (s, &p) in sum[bin * h..(bin + 1) * h].iter_mut().zip(frame) {
@@ -126,7 +174,7 @@ pub fn binned_heatmap(x: &[f32], key_pct: &[f32], fs: f64) -> Option<Grid> {
 /// Откуда пик в спектре.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PeakSource {
-    /// Частота пика следует за оборотами моторов: это их гармоника с таким номером.
+    /// Частота пика следует за оборотами моторов: это их гармоника с таким номером (1–6).
     Harmonic(u32),
     /// Частота пика от оборотов не зависит — резонанс рамы или крепления.
     Fixed,
@@ -170,11 +218,14 @@ pub fn peak_source(grid: &Grid, rpm_max_hz: f64, f_max: f64, peak_hz: f64) -> Pe
     };
     let fixed = along(&|_| peak_hz);
     // Гармоника подходит, только если проходит через пик при оборотах, которые на участке были.
-    let harmonic = (1..=3u32).filter(|&k| (slowest..=fastest).contains(&(peak_hz / k as f64))).map(|k| (along(&|rpm| rpm * k as f64), k)).max_by(|a, b| a.0.total_cmp(&b.0));
+    let harmonic = (1..=6u32).filter(|&k| (slowest..=fastest).contains(&(peak_hz / k as f64))).map(|k| (along(&|rpm| rpm * k as f64), k)).max_by(|a, b| a.0.total_cmp(&b.0));
     match harmonic {
         Some((level, k)) if level > fixed + 3.0 => PeakSource::Harmonic(k),
         Some((level, _)) if fixed <= level + 3.0 => PeakSource::Unclear,
-        _ => PeakSource::Fixed,
+        // «Рама» — только если на этой частоте шум выделяется при любых оборотах,
+        // а не просто потому, что ни одна гармоника сюда не попала.
+        _ if fixed > 3.0 => PeakSource::Fixed,
+        _ => PeakSource::Unclear,
     }
 }
 
@@ -248,6 +299,7 @@ pub struct Margins {
 /// преобразование даёт импульсную характеристику, её накопленная сумма — отклик.
 /// Окна, где стики не двигали, в оценку не входят; если таких окон мало
 /// или они плохо согласуются между собой, отклик не выдаётся.
+#[cfg(test)]
 pub fn step_response(setpoint: &[f32], gyro: &[f32], fs: f64) -> Option<StepResponse> {
     step_response_where(setpoint, gyro, fs, &|_, _| true)
 }
@@ -772,6 +824,23 @@ mod tests {
         let fast = peak(step_response_where(&setpoint, &gyro, FS, &|_, x| top(x) >= 500.0).unwrap());
         assert!(slow < 1.12, "плавные: пик {slow}");
         assert!(fast > 1.25, "резкие: пик {fast}");
+    }
+
+    #[test]
+    fn spectrum_skips_windows_across_recording_gaps() {
+        // Два куска синуса 100 Гц, склеенные со скачком фазы: без учёта разрыва окно на стыке
+        // размазывает пик, с учётом — спектр как у целого сигнала.
+        let whole = sine(100.0, 8000);
+        let mut glued = whole[..4000].to_vec();
+        glued.extend(&whole[4333..]);
+        let gaps = Gaps::find(&(0..glued.len()).map(|i| (i + if i < 4000 { 0 } else { 333 }) as f64 / FS).collect::<Vec<_>>(), FS);
+        assert_eq!(gaps.count(), 1);
+        assert!(gaps.cross(3990, 20) && !gaps.cross(4000, 20) && !gaps.cross(0, 4000));
+        let level_at = |psd: &[[f64; 2]], hz: f64| psd.iter().min_by(|a, b| (a[0] - hz).abs().total_cmp(&(b[0] - hz).abs())).unwrap()[1];
+        let (clean, ignored, handled) = (welch_db(&whole, FS), welch_db(&glued, FS), welch_db_gaps(&glued, FS, &gaps));
+        // В стороне от пика (130 Гц) склейка поднимает уровень; с учётом разрыва он как у целого сигнала.
+        assert!(level_at(&ignored, 130.0) > level_at(&clean, 130.0) + 10.0);
+        assert!((level_at(&handled, 130.0) - level_at(&clean, 130.0)).abs() < 3.0);
     }
 
     /// Шум без повторов — для проверки задержек и фильтров.

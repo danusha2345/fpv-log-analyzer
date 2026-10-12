@@ -42,7 +42,9 @@ fn ensure_steps(loaded: &mut Loaded) {
     if loaded.steps.as_ref().is_none_or(|(range, _)| *range != loaded.range) {
         let (lo, hi) = loaded.range;
         let (setpoint, gyro) = (loaded.axis_cols("setpoint"), loaded.axis_cols("gyroADC"));
-        let steps = [0, 1, 2].map(|a| dsp::step_response(&setpoint[a]?[lo..hi], &gyro[a]?[lo..hi], loaded.sample_rate));
+        let gaps = loaded.gaps.within(lo, hi);
+        // Окна, накрывающие разрыв записи, в оценку не идут.
+        let steps = [0, 1, 2].map(|a| dsp::step_response_where(&setpoint[a]?[lo..hi], &gyro[a]?[lo..hi], loaded.sample_rate, &|start, x| !gaps.cross(start, x.len())));
         loaded.steps = Some((loaded.range, steps));
     }
 }
@@ -64,7 +66,8 @@ fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
     const FAST: f32 = 500.0; // °/с, как в PID-Analyzer
     let ((lo, hi), fs) = (loaded.range, loaded.sample_rate);
     let (setpoint, gyro) = (loaded.axis_cols("setpoint"), loaded.axis_cols("gyroADC"));
-    let per_axis = |keep: &dyn Fn(usize, &[f32]) -> bool| [0, 1, 2].map(|a| dsp::step_response_where(&setpoint[a]?[lo..hi], &gyro[a]?[lo..hi], fs, keep));
+    let gaps = loaded.gaps.within(lo, hi);
+    let per_axis = |keep: &dyn Fn(usize, &[f32]) -> bool| [0, 1, 2].map(|a| dsp::step_response_where(&setpoint[a]?[lo..hi], &gyro[a]?[lo..hi], fs, &|start, x| !gaps.cross(start, x.len()) && keep(start, x)));
     let top = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let groups: SplitSteps = match (split, loaded.throttle_pct()) {
         (StepSplit::Rate, _) => vec![
@@ -466,7 +469,7 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
     let motor_hz = loaded.motor_hz().map(|hz| hz[lo..hi].to_vec());
     let rpm_max = motor_hz.iter().flatten().copied().fold(1.0, f32::max);
     let rpm_pct: Option<Vec<f32>> = motor_hz.map(|hz| hz.iter().map(|v| v / rpm_max * 100.0).collect());
-    let by_rpm = loaded.axis_cols("gyroADC").map(|c| dsp::binned_heatmap(&c?[lo..hi], rpm_pct.as_deref()?, loaded.sample_rate));
+    let by_rpm = loaded.axis_cols("gyroADC").map(|c| dsp::binned_heatmap_gaps(&c?[lo..hi], rpm_pct.as_deref()?, loaded.sample_rate, &loaded.gaps.within(lo, hi)));
     let mut peaks_without_rpm = false;
     for (base, by_axis) in loaded.spectra().clone() {
         if base != "gyroADC" {
