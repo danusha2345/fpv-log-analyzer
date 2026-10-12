@@ -319,15 +319,34 @@ fn findings(loaded: &mut Loaded) -> Vec<(bool, String)> {
         }
     }
 
+    // Карты «частота × обороты» по осям — чтобы сказать, чей пик: моторов или рамы.
+    let (lo, hi) = loaded.range;
+    let motor_hz = loaded.motor_hz().map(|hz| hz[lo..hi].to_vec());
+    let rpm_max = motor_hz.iter().flatten().copied().fold(1.0, f32::max);
+    let rpm_pct: Option<Vec<f32>> = motor_hz.map(|hz| hz.iter().map(|v| v / rpm_max * 100.0).collect());
+    let by_rpm = loaded.axis_cols("gyroADC").map(|c| dsp::binned_heatmap(&c?[lo..hi], rpm_pct.as_deref()?, loaded.sample_rate));
+    let mut peaks_without_rpm = false;
     for (base, by_axis) in loaded.spectra().clone() {
         if base != "gyroADC" {
             continue;
         }
         for (a, spectrum) in by_axis.iter().enumerate() {
             for (hz, above) in spectrum_peaks(spectrum).into_iter().take(2) {
-                out.push((above > 15.0, format!("{}: узкий пик на {hz:.0} Гц, на {above:.0} дБ выше окружающего шума, остаётся после фильтров гироскопа.", AXES[a])));
+                let source = match by_rpm[a].as_ref().map(|grid| dsp::peak_source(grid, rpm_max as f64, nyquist, hz)) {
+                    Some(dsp::PeakSource::Harmonic(k)) => format!(" Частота следует за оборотами: это {k}-я гармоника моторов — шум моторов и пропеллеров, а не рамы."),
+                    Some(dsp::PeakSource::Fixed) => " Частота от оборотов не зависит: это резонанс рамы или крепления, а не моторы.".into(),
+                    Some(dsp::PeakSource::Unclear) => String::new(),
+                    None => {
+                        peaks_without_rpm = true;
+                        String::new()
+                    }
+                };
+                out.push((above > 15.0, format!("{}: узкий пик на {hz:.0} Гц, на {above:.0} дБ выше окружающего шума, остаётся после фильтров гироскопа.{source}", AXES[a])));
             }
         }
+    }
+    if peaks_without_rpm {
+        out.push((false, "В логе нет оборотов моторов (eRPM), поэтому нельзя сказать, чьи это пики — моторов или рамы. Обороты пишутся при включённом bidirectional DShot.".into()));
     }
 
     ensure_steps(loaded);

@@ -123,6 +123,61 @@ pub fn binned_heatmap(x: &[f32], key_pct: &[f32], fs: f64) -> Option<Grid> {
     Some(Grid { w: W, h, db })
 }
 
+/// Откуда пик в спектре.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum PeakSource {
+    /// Частота пика следует за оборотами моторов: это их гармоника с таким номером.
+    Harmonic(u32),
+    /// Частота пика от оборотов не зависит — резонанс рамы или крепления.
+    Fixed,
+    /// Различить нельзя: обороты на участке почти не менялись или картина смешанная.
+    Unclear,
+}
+
+/// Определяет источник пика на частоте `peak_hz` по карте «частота × обороты»
+/// (`grid` из [`binned_heatmap`], столбцы — обороты от 0 до `rpm_max_hz`,
+/// строки — частоты от 0 до `f_max`). Сравнивается, где шум выше своего окружения:
+/// вдоль постоянной частоты пика или вдоль линии гармоники оборотов.
+pub fn peak_source(grid: &Grid, rpm_max_hz: f64, f_max: f64, peak_hz: f64) -> PeakSource {
+    let row_of = |hz: f64| (hz / f_max * (grid.h - 1) as f64).round() as usize;
+    // Столбцы с данными: обороты и уровни, приведённые к медиане столбца.
+    let columns: Vec<(f64, Vec<f32>)> = (0..grid.w)
+        .filter(|&c| !grid.db[c * grid.h].is_nan())
+        .map(|c| {
+            let column = &grid.db[c * grid.h..(c + 1) * grid.h];
+            let mut sorted = column.to_vec();
+            let median = *sorted.select_nth_unstable_by(grid.h / 2, f32::total_cmp).1;
+            ((c as f64 + 0.5) / grid.w as f64 * rpm_max_hz, column.iter().map(|v| v - median).collect())
+        })
+        .collect();
+    let (Some(slowest), Some(fastest)) = (columns.first().map(|c| c.0), columns.last().map(|c| c.0)) else {
+        return PeakSource::Unclear;
+    };
+    // Если обороты менялись меньше чем на четверть, линия гармоники и постоянная частота почти совпадают.
+    if fastest < slowest * 1.25 {
+        return PeakSource::Unclear;
+    }
+    // Средний уровень вдоль линии `частота(обороты)`: берётся максимум из трёх соседних строк.
+    let along = |hz_at: &dyn Fn(f64) -> f64| {
+        let levels: Vec<f32> = columns
+            .iter()
+            .filter_map(|(rpm, column)| {
+                let row = row_of(hz_at(*rpm));
+                (row + 1 < grid.h).then(|| column[row.saturating_sub(1)..=row + 1].iter().copied().fold(f32::MIN, f32::max))
+            })
+            .collect();
+        if levels.len() * 2 < columns.len() { f32::MIN } else { levels.iter().sum::<f32>() / levels.len() as f32 }
+    };
+    let fixed = along(&|_| peak_hz);
+    // Гармоника подходит, только если проходит через пик при оборотах, которые на участке были.
+    let harmonic = (1..=3u32).filter(|&k| (slowest..=fastest).contains(&(peak_hz / k as f64))).map(|k| (along(&|rpm| rpm * k as f64), k)).max_by(|a, b| a.0.total_cmp(&b.0));
+    match harmonic {
+        Some((level, k)) if level > fixed + 3.0 => PeakSource::Harmonic(k),
+        Some((level, _)) if fixed <= level + 3.0 => PeakSource::Unclear,
+        _ => PeakSource::Fixed,
+    }
+}
+
 /// Отклик на единичную ступеньку и число окон, по которым он получен.
 pub struct StepResponse {
     /// Точки `[время, мс; отклик]`; 1.0 — выход сравнялся с заданием.
@@ -446,6 +501,28 @@ mod tests {
         let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
         eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
         assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
+    }
+
+    #[test]
+    fn peak_source_tells_motor_harmonic_from_frame_resonance() {
+        // Обороты плавно ходят между 100 и 220 Гц; в сигнале постоянный тон 150 Гц
+        // (резонанс рамы) и вторая гармоника оборотов (200–440 Гц).
+        let fs = 2000.0;
+        let (mut phase, mut x, mut rpm_pct) = (0f64, Vec::new(), Vec::new());
+        for i in 0..80_000 {
+            let t = i as f64 / fs;
+            let rpm = 160.0 + 60.0 * (std::f64::consts::TAU * t / 8.0).sin();
+            phase += std::f64::consts::TAU * 2.0 * rpm / fs;
+            x.push(((std::f64::consts::TAU * 150.0 * t).sin() + phase.sin()) as f32);
+            rpm_pct.push((rpm / 220.0 * 100.0) as f32);
+        }
+        let grid = binned_heatmap(&x, &rpm_pct, fs).unwrap();
+        assert_eq!(peak_source(&grid, 220.0, fs / 2.0, 150.0), PeakSource::Fixed);
+        assert_eq!(peak_source(&grid, 220.0, fs / 2.0, 320.0), PeakSource::Harmonic(2));
+
+        // При постоянных оборотах различить нельзя.
+        let steady = vec![70f32; x.len()];
+        assert_eq!(peak_source(&binned_heatmap(&x, &steady, fs).unwrap(), 220.0, fs / 2.0, 150.0), PeakSource::Unclear);
     }
 
     /// Шум без повторов — для проверки задержек и фильтров.
