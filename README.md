@@ -1,61 +1,63 @@
 # FPV Log Analyzer
 
-**Поддержать проект:**
+**English** · [Русский](README.ru.md)
+
+**Support the project:**
 [Boosty](https://boosty.to/danusha/donate) ·
 USDT (TRON / TRC-20) `THyBqiMTWQ7kUH6vVBEdboL7yGLj5mCSrX` ·
 GRAM / TON `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
 
-Анализатор blackbox-логов FPV-дронов: по графикам помогает найти причину
-проблемы — шум, фильтры, отклик, моторы. Не автотюнер. Linux и Windows,
-один исполняемый файл.
+A blackbox log analyzer for FPV drones: charts that help you find the cause of
+a problem — noise, filters, response, motors. Not an autotuner. Linux and
+Windows, a single executable.
 
-Читает логи Betaflight (3.x – 2026.x), INAV, EmuFlight и Rotorflight, в том
-числе с нестандартными полями.
+Reads logs from Betaflight (3.x – 2026.x), INAV, EmuFlight and Rotorflight,
+including logs with non-standard fields. The interface is currently in Russian.
 
-![Обзор](docs/screens/overview.png)
+![Overview](docs/screens/overview.png)
 
-## Запуск
+## Run
 
 ```bash
-cargo run --release -- путь/к/логу.bbl
+cargo run --release -- path/to/log.bbl
 ```
 
-Лог можно перетащить в окно или открыть кнопкой «Открыть лог…».
+You can also drop a log onto the window or use the "Открыть лог…" (Open log) button.
 
-## Что показывает
+## What it shows
 
-| Вкладка | Содержание |
+| Tab | Contents |
 |---|---|
-| Обзор | Находки: чей пик — моторов или рамы, prop wash, запас по фазе, насыщение моторов; события лога |
-| Кривые | Сигналы по Roll / Pitch / Yaw. Масштаб по времени задаёт участок для остального анализа |
-| Спектр | Шум до и после фильтров, частоты и задержка фильтров, пробный фильтр |
-| Карта шума | Шум от газа или оборотов; поверх — срезы фильтров и гармоники оборотов |
-| Спектрограмма | Шум во времени |
-| Отклик | Отклик на ступеньку, усиление и фаза, запас по фазе; раздельно по скорости стиков и по газу |
-| Ошибка | Ошибка слежения и её зависимость от скорости стиков |
-| Моторы | Загрузка, насыщение, вибрация на частоте вращения каждого мотора |
-| Настройки | Параметры из лога; при сравнении — отличия двух логов |
+| Overview | Findings: whether a peak comes from motors or the frame, prop wash, phase margin, motor saturation; log events |
+| Curves | Signals per Roll / Pitch / Yaw. The time zoom selects the range for the rest of the analysis |
+| Spectrum | Noise before and after filters, filter cutoffs and delay, a trial filter |
+| Noise map | Noise vs throttle or motor RPM, with filter cutoffs and RPM harmonics overlaid |
+| Spectrogram | Noise over time |
+| Response | Step response, gain and phase, phase margin; split by stick rate or by throttle |
+| Error | Tracking error and how it depends on stick rate |
+| Motors | Load, saturation, vibration at each motor's rotation frequency |
+| Settings | Parameters from the log; differences between two logs when comparing |
 
-«Сравнить с…» накладывает второй лог на спектр и отклик, «Сохранить снимок»
-пишет PNG рядом с логом.
+"Сравнить с…" (Compare with) overlays a second log on the spectrum and the
+response; "Сохранить снимок" (Save snapshot) writes a PNG next to the log.
 
-![Кривые](docs/screens/curves.png)
-![Спектр](docs/screens/spectrum.png)
-![Карта шума](docs/screens/heatmap.png)
-![Спектрограмма](docs/screens/spectrogram.jpg)
-![Отклик](docs/screens/step.png)
-![Моторы](docs/screens/motors.png)
+![Curves](docs/screens/curves.png)
+![Spectrum](docs/screens/spectrum.png)
+![Noise map](docs/screens/heatmap.png)
+![Spectrogram](docs/screens/spectrogram.jpg)
+![Response](docs/screens/step.png)
+![Motors](docs/screens/motors.png)
 
-## Без окна
+## Without a window
 
 ```bash
-fpv-log-analyzer лог.bbl report      # находки и события текстом
-fpv-log-analyzer лог.bbl csv         # запись в CSV
-fpv-log-analyzer лог.bbl response    # спектры, задержка, отклик, запасы таблицей
-fpv-log-analyzer лог.bbl step+save   # снимок вкладки в PNG
+fpv-log-analyzer log.bbl report      # findings and events as text
+fpv-log-analyzer log.bbl csv         # the record as CSV
+fpv-log-analyzer log.bbl response    # spectra, delay, response and margins as a table
+fpv-log-analyzer log.bbl step+save   # a PNG snapshot of a tab
 ```
 
-## Сборка и проверка
+## Build and test
 
 ```bash
 cargo build --release                                   # Linux
@@ -63,4 +65,4 @@ cargo build --release --target x86_64-pc-windows-gnu    # Windows
 cargo test --release
 ```
 
-Состояние, план и известные слабые места — в [docs/TRACKER.md](docs/TRACKER.md).
+Status, plan and known weak spots are in [docs/TRACKER.md](docs/TRACKER.md) (in Russian).
