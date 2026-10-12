@@ -12,9 +12,10 @@ GRAM / TON `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
 один исполняемый файл.
 
 Читает логи Betaflight (3.x – 2026.x), INAV, EmuFlight и Rotorflight, в том
-числе с нестандартными полями.
+числе с нестандартными полями. Интерфейс — на русском и английском: язык берётся
+из системы и переключается кнопкой в верхней панели.
 
-![Обзор](docs/screens/overview.png)
+![Обзор](docs/screens/ru/overview.png)
 
 ## Запуск
 
@@ -41,12 +42,12 @@ cargo run --release -- путь/к/логу.bbl
 «Сравнить с…» накладывает второй лог на спектр и отклик, «Сохранить снимок»
 пишет PNG рядом с логом.
 
-![Кривые](docs/screens/curves.png)
-![Спектр](docs/screens/spectrum.png)
-![Карта шума](docs/screens/heatmap.png)
-![Спектрограмма](docs/screens/spectrogram.jpg)
-![Отклик](docs/screens/step.png)
-![Моторы](docs/screens/motors.png)
+![Кривые](docs/screens/ru/curves.png)
+![Спектр](docs/screens/ru/spectrum.png)
+![Карта шума](docs/screens/ru/heatmap.png)
+![Спектрограмма](docs/screens/ru/spectrogram.jpg)
+![Отклик](docs/screens/ru/step.png)
+![Моторы](docs/screens/ru/motors.png)
 
 ## Без окна
 
@@ -64,5 +65,3 @@ cargo build --release                                   # Linux
 cargo build --release --target x86_64-pc-windows-gnu    # Windows
 cargo test --release
 ```
-
-Состояние, план и известные слабые места — в [docs/TRACKER.md](docs/TRACKER.md).

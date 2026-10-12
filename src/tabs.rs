@@ -68,8 +68,8 @@ fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
     let top = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let groups: SplitSteps = match (split, loaded.throttle_pct()) {
         (StepSplit::Rate, _) => vec![
-            (format!("плавные движения, до {FAST:.0} °/с"), per_axis(&|_, x| top(x) < FAST)),
-            (format!("резкие, от {FAST:.0} °/с"), per_axis(&|_, x| top(x) >= FAST)),
+            (tf!("плавные движения, до {FAST:.0} °/с", "smooth moves, below {FAST:.0} °/s"), per_axis(&|_, x| top(x) < FAST)),
+            (tf!("резкие, от {FAST:.0} °/с", "sharp moves, from {FAST:.0} °/s"), per_axis(&|_, x| top(x) >= FAST)),
         ],
         (StepSplit::Throttle, Some(throttle)) => {
             let throttle = &throttle[lo..hi];
@@ -80,9 +80,9 @@ fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
             let window = (fs * 2.0) as usize;
             let mean = |start: usize| throttle[start..(start + window).min(throttle.len())].iter().sum::<f32>() / window as f32;
             vec![
-                (format!("малый газ, до {low:.0} %"), per_axis(&|start, _| mean(start) < low)),
-                (format!("средний газ, {low:.0}–{high:.0} %"), per_axis(&|start, _| (low..high).contains(&mean(start)))),
-                (format!("большой газ, от {high:.0} %"), per_axis(&|start, _| mean(start) >= high)),
+                (tf!("малый газ, до {low:.0} %", "low throttle, below {low:.0} %"), per_axis(&|start, _| mean(start) < low)),
+                (tf!("средний газ, {low:.0}–{high:.0} %", "mid throttle, {low:.0}–{high:.0} %"), per_axis(&|start, _| (low..high).contains(&mean(start)))),
+                (tf!("большой газ, от {high:.0} %", "high throttle, from {high:.0} %"), per_axis(&|start, _| mean(start) >= high)),
             ]
         }
         _ => Vec::new(),
@@ -93,10 +93,10 @@ fn ensure_split_steps(loaded: &mut Loaded, split: StepSplit) {
 /// Отклик на ступеньку и частотная характеристика по осям, по видимому на кривых участку.
 pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
     ui.horizontal(|ui| {
-        ui.label("Отклик");
-        ui.selectable_value(&mut view.step_split, StepSplit::None, "Общий");
-        ui.selectable_value(&mut view.step_split, StepSplit::Rate, "По скорости стиков").on_hover_text("Отдельно для плавных и резких движений. Расходятся — настройка ведёт себя по-разному на малых и больших скоростях.");
-        ui.selectable_value(&mut view.step_split, StepSplit::Throttle, "По газу").on_hover_text("Отдельно для малого, среднего и большого газа. Расходятся — усиление контура плывёт с газом (смотрите TPA).");
+        ui.label(t!("Отклик", "Response"));
+        ui.selectable_value(&mut view.step_split, StepSplit::None, t!("Общий", "Overall"));
+        ui.selectable_value(&mut view.step_split, StepSplit::Rate, t!("По скорости стиков", "By stick rate")).on_hover_text(t!("Отдельно для плавных и резких движений. Расходятся — настройка ведёт себя по-разному на малых и больших скоростях.", "Separately for smooth and sharp moves. If they differ, the tune behaves differently at low and high rates."));
+        ui.selectable_value(&mut view.step_split, StepSplit::Throttle, t!("По газу", "By throttle")).on_hover_text(t!("Отдельно для малого, среднего и большого газа. Расходятся — усиление контура плывёт с газом (смотрите TPA).", "Separately for low, mid and high throttle. If they differ, loop gain drifts with throttle (see TPA)."));
     });
     ensure_steps(loaded);
     ensure_split_steps(loaded, view.step_split);
@@ -115,7 +115,7 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
             groups.iter().enumerate().filter_map(|(i, (name, by_axis))| Some((theme::nth_series(i), name.as_str(), by_axis[a].as_ref()?))).collect()
         };
         if curves.is_empty() {
-            ui.colored_label(theme::MUTED, format!("{axis}: отклик не получен. Нужно не меньше 15 с движений стиков быстрее 20 °/с на выбранном участке и поля setpoint и gyroADC в логе."));
+            ui.colored_label(theme::MUTED, tf!("{axis}: отклик не получен. Нужно не меньше 15 с движений стиков быстрее 20 °/с на выбранном участке и поля setpoint и gyroADC в логе.", "{axis}: no response estimate. It needs at least 15 s of stick moves faster than 20 °/s in the selected range, and the setpoint and gyroADC fields in the log."));
             ui.add_space(height);
             continue;
         }
@@ -125,17 +125,17 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
                 let step = curves[0].2;
                 let peak = step.points.iter().map(|p| p[1]).fold(0.0, f64::max);
                 let half = step.points.iter().find(|p| p[1] >= 0.5).map_or(f64::NAN, |p| p[0]);
-                let band = step.bandwidth_hz().map_or("выше 100 Гц или не определена".into(), |hz| format!("{hz:.0} Гц"));
-                let margin = step.margins().map_or("не определён".into(), |m| format!("{:.0}° на {:.0} Гц, пик ошибки {:+.0} дБ на {:.0} Гц", m.phase_margin_deg, m.crossover_hz, m.error_peak_db, m.error_peak_hz));
-                ui.colored_label(theme::MUTED, format!("окон {}, пик {peak:.2}, половина задания через {half:.0} мс, полоса по −3 дБ: {band}, запас по фазе: {margin}", step.windows)).on_hover_text(
-                    "Запас по фазе — насколько контур далёк от раскачки: меньше 45° — близко. Пик ошибки — во сколько раз контур усиливает рассогласование на худшей частоте. Оба считаются по измеренной связи задания и гироскопа в предположении, что feedforward мал.",
+                let band = step.bandwidth_hz().map_or(t!("выше 100 Гц или не определена", "above 100 Hz or undefined").into(), |hz| tf!("{hz:.0} Гц", "{hz:.0} Hz"));
+                let margin = step.margins().map_or(t!("не определён", "undefined").into(), |m| tf!("{:.0}° на {:.0} Гц, пик ошибки {:+.0} дБ на {:.0} Гц", "{:.0}° at {:.0} Hz, error peak {:+.0} dB at {:.0} Hz", m.phase_margin_deg, m.crossover_hz, m.error_peak_db, m.error_peak_hz));
+                ui.colored_label(theme::MUTED, tf!("окон {}, пик {peak:.2}, половина задания через {half:.0} мс, полоса по −3 дБ: {band}, запас по фазе: {margin}", "{} windows, peak {peak:.2}, half of setpoint in {half:.0} ms, −3 dB bandwidth: {band}, phase margin: {margin}", step.windows)).on_hover_text(
+                    t!("Запас по фазе — насколько контур далёк от раскачки: меньше 45° — близко. Пик ошибки — во сколько раз контур усиливает рассогласование на худшей частоте. Оба считаются по измеренной связи задания и гироскопа в предположении, что feedforward мал.", "Phase margin shows how far the loop is from oscillating: below 45° is close. Error peak is how much the loop amplifies the mismatch at the worst frequency. Both are derived from the measured setpoint-to-gyro relation, assuming feedforward is small."),
                 );
             } else {
                 for (i, (name, by_axis)) in groups.iter().enumerate() {
                     crate::swatch_color(ui, theme::nth_series(i));
                     match &by_axis[a] {
-                        Some(step) => ui.colored_label(theme::MUTED, format!("{name}: пик {:.2}, окон {}", step.points.iter().map(|p| p[1]).fold(0.0, f64::max), step.windows)),
-                        None => ui.colored_label(theme::MUTED, format!("{name}: мало данных")),
+                        Some(step) => ui.colored_label(theme::MUTED, tf!("{name}: пик {:.2}, окон {}", "{name}: peak {:.2}, {} windows", step.points.iter().map(|p| p[1]).fold(0.0, f64::max), step.windows)),
+                        None => ui.colored_label(theme::MUTED, tf!("{name}: мало данных", "{name}: not enough data")),
                     };
                 }
             }
@@ -144,27 +144,27 @@ pub fn show_step(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
         let crossover = curves[0].2.margins().filter(|_| groups.is_empty()).map(|m| m.crossover_hz);
         ui.columns(3, |columns| {
             let x_label = |plot: egui_plot::Plot<'static>, label: &'static str| if a == 2 { plot.x_axis_label(label) } else { plot };
-            x_label(new_plot(("step", a)).height(height).link_axis("step", [true, true]).include_y(0.0).include_y(1.2).y_axis_label("отклик"), "время после ступеньки, мс").show(&mut columns[0], |plot| {
-                plot.hline(HLine::new("задание", 1.0).color(theme::MUTED).style(LineStyle::dashed_dense()));
+            x_label(new_plot(("step", a)).height(height).link_axis("step", [true, true]).include_y(0.0).include_y(1.2).y_axis_label(t!("отклик", "response")), t!("время после ступеньки, мс", "time after step, ms")).show(&mut columns[0], |plot| {
+                plot.hline(HLine::new(t!("задание", "setpoint"), 1.0).color(theme::MUTED).style(LineStyle::dashed_dense()));
                 for (color, name, step) in &curves {
                     plot.line(line(name, step.points.clone()).color(*color));
                 }
                 if let Some(other) = other {
-                    plot.line(line("gyroADC", other.points.clone()).name("сравнение").style(LineStyle::dashed_loose()));
+                    plot.line(line("gyroADC", other.points.clone()).name(t!("сравнение", "comparison")).style(LineStyle::dashed_loose()));
                 }
             });
             // Усиление и фаза — на отдельных графиках: у них разные единицы.
-            for (column, (id, label, value)) in [("gain", "усиление, дБ", 1), ("phase", "фаза, °", 2)].into_iter().enumerate() {
+            for (column, (id, label, value)) in [("gain", t!("усиление, дБ", "gain, dB"), 1), ("phase", t!("фаза, °", "phase, °"), 2)].into_iter().enumerate() {
                 let curve = |s: &dsp::StepResponse| s.bode.iter().map(|p| [p[0], p[value]]).collect::<Vec<_>>();
-                x_label(new_plot((id, a)).height(height).link_axis(id, [true, true]).y_axis_label(label), "частота, Гц").show(&mut columns[column + 1], |plot| {
+                x_label(new_plot((id, a)).height(height).link_axis(id, [true, true]).y_axis_label(label), t!("частота, Гц", "frequency, Hz")).show(&mut columns[column + 1], |plot| {
                     for (color, name, step) in &curves {
                         plot.line(line(name, curve(step)).color(*color));
                     }
                     if let Some(other) = other {
-                        plot.line(line("gyroADC", curve(other)).name("сравнение").style(LineStyle::dashed_loose()));
+                        plot.line(line("gyroADC", curve(other)).name(t!("сравнение", "comparison")).style(LineStyle::dashed_loose()));
                     }
                     if let Some(hz) = crossover {
-                        plot.vline(egui_plot::VLine::new("частота среза контура", hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
+                        plot.vline(egui_plot::VLine::new(t!("частота среза контура", "loop crossover frequency"), hz).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
                     }
                 });
             }
@@ -242,16 +242,16 @@ pub fn show_motors(ui: &mut egui::Ui, loaded: &mut Loaded) {
     ensure_motors(loaded);
     let motors = &loaded.motors.as_ref().unwrap().1;
     if motors.stats.is_empty() {
-        ui.colored_label(theme::MUTED, "В логе нет полей motor[…]");
+        ui.colored_label(theme::MUTED, t!("В логе нет полей motor[…]", "The log has no motor[…] fields"));
         return;
     }
     let has_rotation = motors.rotation.iter().any(Option::is_some);
     egui::Grid::new("motor_stats").num_columns(9).spacing([24.0, 6.0]).show(ui, |ui| {
-        for title in ["", "Мотор", "Средний выход", "На максимуме", "На минимуме"] {
+        for title in ["", t!("Мотор", "Motor"), t!("Средний выход", "Mean output"), t!("На максимуме", "At maximum"), t!("На минимуме", "At minimum")] {
             ui.colored_label(theme::MUTED, title);
         }
         if has_rotation {
-            for title in ["Обороты", "Вибрация Roll", "Вибрация Pitch", "Вибрация Yaw"] {
+            for title in [t!("Обороты", "Speed"), t!("Вибрация Roll", "Roll vibration"), t!("Вибрация Pitch", "Pitch vibration"), t!("Вибрация Yaw", "Yaw vibration")] {
                 ui.colored_label(theme::MUTED, title);
             }
         }
@@ -260,16 +260,16 @@ pub fn show_motors(ui: &mut egui::Ui, loaded: &mut Loaded) {
             swatch(ui, name);
             ui.label(name);
             ui.label(format!("{mean:.1} %"));
-            ui.label(format!("{at_max:.2} % времени"));
-            ui.label(format!("{at_min:.2} % времени"));
+            ui.label(tf!("{at_max:.2} % времени", "{at_max:.2} % of time"));
+            ui.label(tf!("{at_min:.2} % времени", "{at_min:.2} % of time"));
             if let Some((hz, by_axis)) = rotation {
-                ui.label(format!("{hz:.0} Гц"));
+                ui.label(tf!("{hz:.0} Гц", "{hz:.0} Hz"));
                 for vibration in by_axis {
                     match vibration {
                         // Вибрация, не превышающая фон вдвое, показана приглушённо: мотор в ней не виден.
-                        Some(v) if v.amplitude > 2.0 * v.floor => ui.label(format!("{:.1} °/с", v.amplitude)),
-                        Some(v) => ui.colored_label(theme::MUTED, format!("{:.1} °/с", v.amplitude)),
-                        None => ui.colored_label(theme::MUTED, "нет данных"),
+                        Some(v) if v.amplitude > 2.0 * v.floor => ui.label(tf!("{:.1} °/с", "{:.1} °/s", v.amplitude)),
+                        Some(v) => ui.colored_label(theme::MUTED, tf!("{:.1} °/с", "{:.1} °/s", v.amplitude)),
+                        None => ui.colored_label(theme::MUTED, t!("нет данных", "no data")),
                     };
                 }
             }
@@ -277,17 +277,17 @@ pub fn show_motors(ui: &mut egui::Ui, loaded: &mut Loaded) {
         }
     });
     if has_rotation {
-        let source = if motors.rotation_from_raw { "по сырому гироскопу" } else { "по отфильтрованному гироскопу — RPM-фильтр эту частоту давит, значения занижены" };
-        ui.colored_label(theme::MUTED, format!("Вибрация — амплитуда колебаний гироскопа на частоте вращения мотора, {source}. Приглушённые значения не отличаются от фона."));
+        let source = if motors.rotation_from_raw { t!("по сырому гироскопу", "from the raw gyro") } else { t!("по отфильтрованному гироскопу — RPM-фильтр эту частоту давит, значения занижены", "from the filtered gyro — the RPM filter suppresses this frequency, so the values are too low") };
+        ui.colored_label(theme::MUTED, tf!("Вибрация — амплитуда колебаний гироскопа на частоте вращения мотора, {source}. Приглушённые значения не отличаются от фона.", "Vibration is the gyro oscillation amplitude at the motor's rotation frequency, {source}. Dimmed values do not stand out from the background."));
     }
     if let Some((mean, p95)) = motors.throttle {
         ui.horizontal(|ui| {
-            ui.label("Газ");
-            ui.colored_label(theme::MUTED, format!("в среднем {mean:.0} %, 95 % времени не выше {p95:.0} %"));
+            ui.label(t!("Газ", "Throttle"));
+            ui.colored_label(theme::MUTED, tf!("в среднем {mean:.0} %, 95 % времени не выше {p95:.0} %", "{mean:.0} % on average, at or below {p95:.0} % for 95 % of the time"));
         });
     }
     ui.add_space(4.0);
-    new_plot("motor_spectrum").x_axis_label("частота, Гц").y_axis_label("выход моторов, дБ").show(ui, |plot| {
+    new_plot("motor_spectrum").x_axis_label(t!("частота, Гц", "frequency, Hz")).y_axis_label(t!("выход моторов, дБ", "motor output, dB")).show(ui, |plot| {
         for ((name, ..), spectrum) in motors.stats.iter().zip(&motors.spectra) {
             plot.line(line(name, spectrum.clone()));
         }
@@ -362,19 +362,19 @@ pub fn show_error(ui: &mut egui::Ui, loaded: &mut Loaded) {
     let height = captioned_row_height(ui);
     for (a, axis) in AXES.iter().enumerate() {
         let Some(error) = &errors[a] else {
-            ui.colored_label(theme::MUTED, format!("{axis}: в логе нет полей setpoint и gyroADC"));
+            ui.colored_label(theme::MUTED, tf!("{axis}: в логе нет полей setpoint и gyroADC", "{axis}: the log has no setpoint and gyroADC fields"));
             ui.add_space(height);
             continue;
         };
         ui.horizontal(|ui| {
             ui.label(*axis);
-            ui.colored_label(theme::MUTED, format!("среднеквадратичная ошибка {:.1} °/с, 95 % времени не больше {:.1} °/с", error.rms, error.p95));
+            ui.colored_label(theme::MUTED, tf!("среднеквадратичная ошибка {:.1} °/с, 95 % времени не больше {:.1} °/с", "RMS error {:.1} °/s, at or below {:.1} °/s for 95 % of the time", error.rms, error.p95));
         });
         ui.columns(2, |columns| {
             let x_label = |plot: egui_plot::Plot<'static>, label: &'static str| if a == 2 { plot.x_axis_label(label) } else { plot };
-            x_label(new_plot(("error", a)).height(height).link_axis("error", [true, false]).include_y(0.0).y_axis_label("доля времени, %"), "задание минус гироскоп, °/с")
+            x_label(new_plot(("error", a)).height(height).link_axis("error", [true, false]).include_y(0.0).y_axis_label(t!("доля времени, %", "share of time, %")), t!("задание минус гироскоп, °/с", "setpoint minus gyro, °/s"))
                 .show(&mut columns[0], |plot| plot.line(line("gyroADC", error.histogram.clone()).fill(0.0)));
-            x_label(new_plot(("error_rate", a)).height(height).link_axis("error_rate", [true, false]).include_y(0.0).y_axis_label("средняя ошибка, °/с"), "заданная скорость по модулю, °/с")
+            x_label(new_plot(("error_rate", a)).height(height).link_axis("error_rate", [true, false]).include_y(0.0).y_axis_label(t!("средняя ошибка, °/с", "mean error, °/s")), t!("заданная скорость по модулю, °/с", "absolute commanded rate, °/s"))
                 .show(&mut columns[1], |plot| plot.line(line("gyroADC", error.by_rate.clone())));
         });
     }
@@ -415,25 +415,25 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
     let mut out = Vec::new();
     let nyquist = loaded.sample_rate / 2.0;
     if nyquist < 500.0 {
-        out.push((true, format!("Лог записан с частотой {:.0} Гц: шум выше {nyquist:.0} Гц в нём не виден, а более высокие частоты отражаются в видимую полосу. Для анализа шума записывайте лог на 2 кГц и выше.", loaded.sample_rate)));
+        out.push((true, tf!("Лог записан с частотой {:.0} Гц: шум выше {nyquist:.0} Гц в нём не виден, а более высокие частоты отражаются в видимую полосу. Для анализа шума записывайте лог на 2 кГц и выше.", "The log was recorded at {:.0} Hz: noise above {nyquist:.0} Hz is not visible in it, and higher frequencies fold back into the visible band. For noise analysis, log at 2 kHz or higher.", loaded.sample_rate)));
     }
     if loaded.log.corrupt >= 5 {
-        out.push((loaded.log.corrupt >= 50, format!("В записи {} повреждённых участков: носитель не успевает или в файле остались куски старых данных. Вокруг разрывов графикам доверять нельзя.", loaded.log.corrupt)));
+        out.push((loaded.log.corrupt >= 50, tf!("В записи {} повреждённых участков: носитель не успевает или в файле остались куски старых данных. Вокруг разрывов графикам доверять нельзя.", "The recording has {} damaged regions: the storage cannot keep up, or the file contains leftovers of old data. Do not trust the charts around the gaps.", loaded.log.corrupt)));
     }
 
     ensure_motors(loaded);
     let stats = &loaded.motors.as_ref().unwrap().1.stats;
     for (name, _, at_max, _) in stats {
         if *at_max > 1.0 {
-            out.push((true, format!("{name} упирается в максимум {at_max:.1} % времени: запаса тяги не хватает, в эти моменты управление по осям теряется.")));
+            out.push((true, tf!("{name} упирается в максимум {at_max:.1} % времени: запаса тяги не хватает, в эти моменты управление по осям теряется.", "{name} hits the maximum {at_max:.1} % of the time: there is not enough thrust headroom, and axis control is lost at those moments.")));
         }
     }
     if stats.len() >= 3 {
         let mean_all = stats.iter().map(|s| s.1).sum::<f32>() / stats.len() as f32;
         for (name, mean, ..) in stats {
             if (mean - mean_all).abs() > 8.0 {
-                let how = if *mean > mean_all { "нагружен сильнее" } else { "нагружен слабее" };
-                out.push((false, format!("{name} {how} остальных: средний выход {mean:.0} % при среднем по моторам {mean_all:.0} %. Проверьте центровку, пропеллер и мотор.")));
+                let how = if *mean > mean_all { t!("нагружен сильнее", "more") } else { t!("нагружен слабее", "less") };
+                out.push((false, tf!("{name} {how} остальных: средний выход {mean:.0} % при среднем по моторам {mean_all:.0} %. Проверьте центровку, пропеллер и мотор.", "{name} is loaded {how} than the others: mean output {mean:.0} % against a motor average of {mean_all:.0} %. Check the centre of gravity, the prop and the motor.")));
             }
         }
     }
@@ -449,15 +449,15 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
             // Пороги с запасом: разница вдвое встречается и у исправных моторов,
             // а вибрация слабее 3 °/с на управление не влияет.
             if shake > 2.5 * typical && shake > 2.0 * floor && shake > 3.0 {
-                let caveat = if motors.rotation_from_raw { "" } else { " Оценка сделана по отфильтрованному гироскопу и занижена." };
-                out.push((shake > 4.0 * typical, format!("{}: вибрация на частоте его вращения {shake:.1} °/с — в {:.1} раза больше, чем у остальных моторов. Проверьте пропеллер, вал и подшипники этого мотора.{caveat}", motors.stats[m].0, shake / typical)));
+                let caveat = if motors.rotation_from_raw { "" } else { t!(" Оценка сделана по отфильтрованному гироскопу и занижена.", " The estimate comes from the filtered gyro and is too low.") };
+                out.push((shake > 4.0 * typical, tf!("{}: вибрация на частоте его вращения {shake:.1} °/с — в {:.1} раза больше, чем у остальных моторов. Проверьте пропеллер, вал и подшипники этого мотора.{caveat}", "{}: vibration at its rotation frequency is {shake:.1} °/s — {:.1} times that of the other motors. Check this motor's prop, shaft and bearings.{caveat}", motors.stats[m].0, shake / typical)));
             }
         }
     }
 
     for (a, ms) in loaded.delays().into_iter().enumerate() {
         if let Some(ms) = ms.filter(|ms| *ms > 4.0) {
-            out.push((false, format!("{}: фильтры гироскопа задерживают сигнал на {ms:.1} мс. Чем больше задержка, тем ниже достижимая резкость настройки.", AXES[a])));
+            out.push((false, tf!("{}: фильтры гироскопа задерживают сигнал на {ms:.1} мс. Чем больше задержка, тем ниже достижимая резкость настройки.", "{}: gyro filters delay the signal by {ms:.1} ms. The longer the delay, the less sharp a tune can be.", AXES[a])));
         }
     }
 
@@ -475,25 +475,25 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
         for (a, spectrum) in by_axis.iter().enumerate() {
             for (hz, above) in spectrum_peaks(spectrum).into_iter().take(2) {
                 let source = match by_rpm[a].as_ref().map(|grid| dsp::peak_source(grid, rpm_max as f64, nyquist, hz)) {
-                    Some(dsp::PeakSource::Harmonic(k)) => format!(" Частота следует за оборотами: это {k}-я гармоника моторов — шум моторов и пропеллеров, а не рамы."),
-                    Some(dsp::PeakSource::Fixed) => " Частота от оборотов не зависит: это резонанс рамы или крепления, а не моторы.".into(),
+                    Some(dsp::PeakSource::Harmonic(k)) => tf!(" Частота следует за оборотами: это {k}-я гармоника моторов — шум моторов и пропеллеров, а не рамы.", " The frequency follows motor speed: it is motor harmonic {k} — noise from motors and props, not the frame."),
+                    Some(dsp::PeakSource::Fixed) => t!(" Частота от оборотов не зависит: это резонанс рамы или крепления, а не моторы.", " The frequency does not depend on motor speed: it is a frame or mount resonance, not the motors.").into(),
                     Some(dsp::PeakSource::Unclear) => String::new(),
                     None => {
                         peaks_without_rpm = true;
                         String::new()
                     }
                 };
-                out.push((above > 15.0, format!("{}: узкий пик на {hz:.0} Гц, на {above:.0} дБ выше окружающего шума, остаётся после фильтров гироскопа.{source}", AXES[a])));
+                out.push((above > 15.0, tf!("{}: узкий пик на {hz:.0} Гц, на {above:.0} дБ выше окружающего шума, остаётся после фильтров гироскопа.{source}", "{}: a narrow peak at {hz:.0} Hz, {above:.0} dB above the surrounding noise, remains after the gyro filters.{source}", AXES[a])));
             }
         }
     }
     if peaks_without_rpm {
-        out.push((false, "В логе нет оборотов моторов (eRPM), поэтому нельзя сказать, чьи это пики — моторов или рамы. Обороты пишутся при включённом bidirectional DShot.".into()));
+        out.push((false, t!("В логе нет оборотов моторов (eRPM), поэтому нельзя сказать, чьи это пики — моторов или рамы. Обороты пишутся при включённом bidirectional DShot.", "The log has no motor speed (eRPM), so it is impossible to tell whether these peaks come from the motors or the frame. Motor speed is logged when bidirectional DShot is on.").into()));
     }
 
     for (a, wash) in prop_wash.iter().enumerate() {
         if let Some(wash) = wash.as_ref().filter(|w| w.ratio > 2.0) {
-            out.push((wash.ratio > 4.0, format!("{}: после сбросов газа колебания в полосе 20–90 Гц в {:.1} раза сильнее обычного — prop wash (сбросов газа: {}).", AXES[a], wash.ratio, wash.events)));
+            out.push((wash.ratio > 4.0, tf!("{}: после сбросов газа колебания в полосе 20–90 Гц в {:.1} раза сильнее обычного — prop wash (сбросов газа: {}).", "{}: after throttle chops, oscillation in the 20–90 Hz band is {:.1} times stronger than usual — prop wash (throttle chops: {}).", AXES[a], wash.ratio, wash.events)));
         }
     }
 
@@ -505,20 +505,20 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3], balance
         if peak > 3.0 {
             // Втрое выше задания контур не отвечает: значит, гироскоп на этом участке
             // с заданием почти не связан (ручной режим, самолёт, срыв) и оценка не годится.
-            out.push((false, format!("{}: отклик на ступеньку получился неправдоподобным (пик {peak:.1}) — на этом участке гироскоп плохо следует заданию, оценке отклика доверять нельзя.", AXES[a])));
+            out.push((false, tf!("{}: отклик на ступеньку получился неправдоподобным (пик {peak:.1}) — на этом участке гироскоп плохо следует заданию, оценке отклика доверять нельзя.", "{}: the step response came out implausible (peak {peak:.1}) — the gyro barely follows the setpoint in this range, so the response estimate cannot be trusted.", AXES[a])));
             continue;
         }
         if peak > 1.2 {
-            out.push((true, format!("{}: перерегулирование {:.0} % в отклике на ступеньку.", AXES[a], (peak - 1.0) * 100.0)));
+            out.push((true, tf!("{}: перерегулирование {:.0} % в отклике на ступеньку.", "{}: {:.0} % overshoot in the step response.", AXES[a], (peak - 1.0) * 100.0)));
         }
         if half > 40.0 {
-            out.push((false, format!("{}: медленный отклик — половина задания достигается через {half:.0} мс.", AXES[a])));
+            out.push((false, tf!("{}: медленный отклик — половина задания достигается через {half:.0} мс.", "{}: slow response — half of the setpoint is reached in {half:.0} ms.", AXES[a])));
         }
         // Запас по фазе выводится из связи «задание → гироскоп»; при заметном feedforward
         // (больше половины от P) эта связь идёт в обход обратной связи и оценка не годится.
         let term = |base: &str| balance.iter().find(|(b, _)| *b == base).and_then(|(_, by_axis)| by_axis[a]).unwrap_or(0.0);
         if let Some(margins) = step.margins().filter(|m| m.phase_margin_deg < 45.0 && term("axisF") < 0.5 * term("axisP")) {
-            out.push((margins.phase_margin_deg < 30.0, format!("{}: запас по фазе {:.0}° на {:.0} Гц — контур близок к раскачке (желательно не меньше 45°).", AXES[a], margins.phase_margin_deg, margins.crossover_hz)));
+            out.push((margins.phase_margin_deg < 30.0, tf!("{}: запас по фазе {:.0}° на {:.0} Гц — контур близок к раскачке (желательно не меньше 45°).", "{}: phase margin {:.0}° at {:.0} Hz — the loop is close to oscillating (at least 45° is desirable).", AXES[a], margins.phase_margin_deg, margins.crossover_hz)));
         }
     }
     out
@@ -539,25 +539,25 @@ pub fn overview(loaded: &mut Loaded) -> &Overview {
 pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         let overview = overview(loaded);
-        ui.colored_label(theme::MUTED, "Всё считается по участку, выбранному масштабом на вкладке «Кривые». Находки — подсказки, куда смотреть, а не диагноз.");
+        ui.colored_label(theme::MUTED, t!("Всё считается по участку, выбранному масштабом на вкладке «Кривые». Находки — подсказки, куда смотреть, а не диагноз.", "Everything is computed over the range selected by zooming on the Curves tab. Findings are hints on where to look, not a diagnosis."));
         ui.add_space(6.0);
-        ui.heading("Находки");
+        ui.heading(t!("Находки", "Findings"));
         if overview.findings.is_empty() {
-            ui.label("По проверяемым признакам замечаний нет.");
+            ui.label(t!("По проверяемым признакам замечаний нет.", "Nothing to report on the checked criteria."));
         }
         for (important, text) in &overview.findings {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(if *important { theme::WARN } else { theme::MUTED }, if *important { "Важно" } else { "Заметка" });
+                ui.colored_label(if *important { theme::WARN } else { theme::MUTED }, if *important { t!("Важно", "Important") } else { t!("Заметка", "Note") });
                 ui.label(text);
             });
         }
 
         if !overview.balance.is_empty() {
             ui.add_space(12.0);
-            ui.heading("Вклад составляющих регулятора");
-            ui.colored_label(theme::MUTED, "Среднеквадратичное значение каждой составляющей выхода регулятора.");
+            ui.heading(t!("Вклад составляющих регулятора", "Controller term contributions"));
+            ui.colored_label(theme::MUTED, t!("Среднеквадратичное значение каждой составляющей выхода регулятора.", "RMS value of each term of the controller output."));
             egui::Grid::new("balance").num_columns(5).spacing([24.0, 6.0]).show(ui, |ui| {
-                for title in ["", "Составляющая", AXES[0], AXES[1], AXES[2]] {
+                for title in ["", t!("Составляющая", "Term"), AXES[0], AXES[1], AXES[2]] {
                     ui.colored_label(theme::MUTED, title);
                 }
                 ui.end_row();
@@ -565,7 +565,7 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
                     swatch(ui, base);
                     ui.label(*base);
                     for value in by_axis {
-                        ui.label(value.map_or("нет".into(), |v| format!("{v:.1}")));
+                        ui.label(value.map_or(t!("нет", "none").into(), |v| format!("{v:.1}")));
                     }
                     ui.end_row();
                 }
@@ -574,10 +574,10 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
 
         if overview.prop_wash.iter().any(Option::is_some) {
             ui.add_space(12.0);
-            ui.heading("Сбросы газа (prop wash)");
-            ui.colored_label(theme::MUTED, "Колебания ошибки слежения в полосе 20–90 Гц за 0.3 с после сброса газа — во сколько раз сильнее обычного на этом участке.");
+            ui.heading(t!("Сбросы газа (prop wash)", "Throttle chops (prop wash)"));
+            ui.colored_label(theme::MUTED, t!("Колебания ошибки слежения в полосе 20–90 Гц за 0.3 с после сброса газа — во сколько раз сильнее обычного на этом участке.", "Tracking-error oscillation in the 20–90 Hz band within 0.3 s after a throttle chop — how many times stronger than usual in this range."));
             egui::Grid::new("prop_wash").num_columns(3).spacing([24.0, 6.0]).show(ui, |ui| {
-                for title in ["Ось", "Сбросов газа", "Колебания после сброса"] {
+                for title in [t!("Ось", "Axis"), t!("Сбросов газа", "Throttle chops"), t!("Колебания после сброса", "Oscillation after a chop")] {
                     ui.colored_label(theme::MUTED, title);
                 }
                 ui.end_row();
@@ -585,7 +585,7 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
                     if let Some(wash) = wash {
                         ui.label(*axis);
                         ui.label(wash.events.to_string());
-                        ui.label(format!("в {:.1} раза сильнее обычного", wash.ratio));
+                        ui.label(tf!("в {:.1} раза сильнее обычного", "{:.1} times stronger than usual", wash.ratio));
                         ui.end_row();
                     }
                 }
@@ -594,11 +594,11 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
 
         if !loaded.log.events.is_empty() {
             ui.add_space(12.0);
-            ui.heading("События в логе");
+            ui.heading(t!("События в логе", "Log events"));
             egui::Grid::new("events").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
                 for (time, event) in &loaded.log.events {
-                    ui.colored_label(theme::MUTED, format!("{time:.2} с"));
-                    ui.label(event);
+                    ui.colored_label(theme::MUTED, tf!("{time:.2} с", "{time:.2} s"));
+                    ui.label(crate::event_text(event));
                     ui.end_row();
                 }
             });
@@ -609,19 +609,19 @@ pub fn show_overview(ui: &mut egui::Ui, loaded: &mut Loaded) {
 /// Параметры из заголовка лога; при сравнении — рядом значения второго лога.
 pub fn show_settings(ui: &mut egui::Ui, loaded: &Loaded, compare: Option<&Loaded>, view: &mut View) {
     ui.horizontal(|ui| {
-        ui.label("Параметр");
-        ui.add(egui::TextEdit::singleline(&mut view.settings_filter).hint_text("часть названия, например lpf").desired_width(260.0));
+        ui.label(t!("Параметр", "Parameter"));
+        ui.add(egui::TextEdit::singleline(&mut view.settings_filter).hint_text(t!("часть названия, например lpf", "part of the name, e.g. lpf")).desired_width(260.0));
         if compare.is_some() {
-            ui.checkbox(&mut view.only_different, "Только отличающиеся");
+            ui.checkbox(&mut view.only_different, t!("Только отличающиеся", "Only differing"));
         }
     });
     let needle = view.settings_filter.to_lowercase();
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("settings").num_columns(3).striped(true).spacing([24.0, 4.0]).show(ui, |ui| {
-            ui.colored_label(theme::MUTED, "Параметр");
-            ui.colored_label(theme::MUTED, "Этот лог");
+            ui.colored_label(theme::MUTED, t!("Параметр", "Parameter"));
+            ui.colored_label(theme::MUTED, t!("Этот лог", "This log"));
             if compare.is_some() {
-                ui.colored_label(theme::MUTED, "Лог сравнения");
+                ui.colored_label(theme::MUTED, t!("Лог сравнения", "Comparison log"));
             }
             ui.end_row();
             // Описания полей кадров — служебные, к настройкам дрона не относятся.
@@ -634,7 +634,7 @@ pub fn show_settings(ui: &mut egui::Ui, loaded: &Loaded, compare: Option<&Loaded
                 ui.label(name);
                 ui.label(value);
                 if let Some(other) = other {
-                    ui.colored_label(if differs { theme::WARN } else { theme::MUTED }, other.unwrap_or("нет в логе"));
+                    ui.colored_label(if differs { theme::WARN } else { theme::MUTED }, other.unwrap_or(t!("нет в логе", "not in the log")));
                 }
                 ui.end_row();
             }

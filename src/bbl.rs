@@ -5,6 +5,19 @@
 
 const LOG_MARKER: &[u8] = b"H Product:Blackbox flight data recorder by Nicholas Sherlock\n";
 
+/// Событие из лога. Текст для показа собирается в интерфейсе — на его языке.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    SyncBeep,
+    InflightAdjustment,
+    LoggingResumed,
+    /// Дизарм и код его причины.
+    Disarm(u32),
+    /// Смена режимов полёта: названия включённых режимов до и после.
+    FlightModes { before: String, now: String },
+    EndOfLog,
+}
+
 pub struct Log {
     pub headers: Vec<(String, String)>,
     /// Имена полей основного кадра (I/P), в порядке заголовка.
@@ -15,8 +28,8 @@ pub struct Log {
     pub time: Vec<f64>,
     /// Сколько в записи повреждённых участков (разрывов), где кадры не читаются.
     pub corrupt: usize,
-    /// События лога: `(время, с; описание)`.
-    pub events: Vec<(f64, String)>,
+    /// События лога: `(время, с; событие)`.
+    pub events: Vec<(f64, Event)>,
 }
 
 impl Log {
@@ -310,13 +323,12 @@ fn parse_frame(
     }
 }
 
-/// Разбирает событие и возвращает его описание; `None` — событие не распознано.
-/// Описание [`END_OF_LOG`] означает конец записи.
-fn parse_event(r: &mut Reader, modes: Option<&Modes>) -> Option<String> {
+/// Разбирает событие; `None` — событие не распознано.
+fn parse_event(r: &mut Reader, modes: Option<&Modes>) -> Option<Event> {
     Some(match r.byte() {
         0 => {
             r.unsigned_vb();
-            "Сигнал синхронизации".into()
+            Event::SyncBeep
         }
         13 => {
             if r.byte() & 0x80 != 0 {
@@ -324,30 +336,28 @@ fn parse_event(r: &mut Reader, modes: Option<&Modes>) -> Option<String> {
             } else {
                 r.signed_vb();
             }
-            "Подстройка в полёте".into()
+            Event::InflightAdjustment
         }
         14 => {
             r.unsigned_vb();
             r.unsigned_vb();
-            "Запись возобновлена".into()
+            Event::LoggingResumed
         }
-        15 => format!("Дизарм, причина {}", r.unsigned_vb()),
+        15 => Event::Disarm(r.unsigned_vb()),
         30 => {
             let (now, before) = (r.unsigned_vb(), r.unsigned_vb());
-            format!("Режимы полёта: {} → {}", mode_names(before, modes), mode_names(now, modes))
+            Event::FlightModes { before: mode_names(before, modes), now: mode_names(now, modes) }
         }
         255 => {
             const END: &[u8] = b"End of log\0";
             if !r.data[r.pos..].starts_with(END) {
                 return None;
             }
-            END_OF_LOG.into()
+            Event::EndOfLog
         }
         _ => return None,
     })
 }
-
-const END_OF_LOG: &str = "Конец записи";
 
 /// Раскладки битов режимов полёта — порядок `boxId` в `src/main/fc/rc_modes.h`
 /// соответствующих версий Betaflight.
@@ -409,17 +419,17 @@ fn modes_of(firmware: &str) -> Option<&'static Modes> {
 }
 
 /// Включённые режимы полёта по битовой маске. Первые три бита одинаковы во всех
-/// прошивках; остальные названы только там, где раскладка известна, иначе показан номер бита.
+/// прошивках; остальные названы только там, где раскладка известна, иначе показан номер бита (`bit N`).
 fn mode_names(mask: u32, modes: Option<&Modes>) -> String {
     let names: Vec<String> = (0..32usize)
         .filter(|bit| mask >> bit & 1 != 0)
         .map(|bit| match modes {
             Some(modes) if !modes[bit].is_empty() => modes[bit].to_string(),
             None if bit < 3 => MODES_4[bit].to_string(),
-            _ => format!("бит {bit}"),
+            _ => format!("bit {bit}"),
         })
         .collect();
-    if names.is_empty() { "нет".into() } else { names.join(", ") }
+    if names.is_empty() { "—".into() } else { names.join(", ") }
 }
 
 fn parse_list<T: std::str::FromStr>(value: &str) -> Vec<T> {
@@ -449,7 +459,7 @@ fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
     let mut headers = Vec::new();
     let mut pos = 0;
     while data[pos..].starts_with(b"H ") {
-        let end = data[pos..].iter().position(|&b| b == b'\n').ok_or("заголовок оборван")?;
+        let end = data[pos..].iter().position(|&b| b == b'\n').ok_or(t!("заголовок оборван", "the header is cut off"))?;
         let line = String::from_utf8_lossy(&data[pos + 2..pos + end]);
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.to_string(), v.to_string()));
@@ -467,7 +477,7 @@ fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
             undeclared_before: None,
         }
     };
-    let names: Vec<String> = get("Field I name").ok_or("нет заголовка Field I name")?.split(',').map(str::to_string).collect();
+    let names: Vec<String> = get("Field I name").ok_or(t!("нет заголовка Field I name", "no Field I name header"))?.split(',').map(str::to_string).collect();
     let (mut def_i, def_p) = (def('I', 'I'), def('P', 'I'));
     if phantom_motor {
         def_i.undeclared_before = names.iter().position(|n| n == "servo[0]").or_else(|| names.iter().position(|n| n == "navState"));
@@ -476,7 +486,7 @@ fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
     let n = names.len();
     for (d, kind) in [(&def_i, 'I'), (&def_p, 'P')] {
         if d.encoding.len() != n || d.predictor.len() != n || d.signed.len() != n {
-            return Err(format!("заголовок лога повреждён: описание кадра {kind} не совпадает с числом полей ({n})"));
+            return Err(tf!("заголовок лога повреждён: описание кадра {kind} не совпадает с числом полей ({n})", "the log header is damaged: the {kind} frame definition does not match the number of fields ({n})"));
         }
     }
     // Служебные кадры (S, G, H) анализу не нужны — их достаточно уметь пропускать.
@@ -484,7 +494,7 @@ fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
     // разбор пересинхронизируется на следующем, а основной поток данных сохраняется.
     let usable = |d: &FrameDef| d.encoding.len() == d.predictor.len() && d.signed.len() >= d.encoding.len();
     let (s_ok, g_ok, h_ok) = (usable(&def_s), usable(&def_g), usable(&def_h));
-    let time_idx = names.iter().position(|s| s == "time").ok_or("нет поля time")?;
+    let time_idx = names.iter().position(|s| s == "time").ok_or(t!("нет поля time", "no time field"))?;
     let modes = get("Firmware revision").and_then(modes_of);
     let iter_idx = def_p.predictor.iter().position(|&p| p == 6);
 
@@ -548,7 +558,7 @@ fn parse_log_as(data: &[u8], phantom_motor: bool) -> Result<Log, String> {
             _ => false,
         };
         // Кадр настоящий, только если сразу за ним начинается следующий (или конец данных).
-        let end_of_log = event.as_deref() == Some(END_OF_LOG);
+        let end_of_log = event == Some(Event::EndOfLog);
         ok &= !r.overrun && (end_of_log || data.get(r.pos).is_none_or(|b| b"IPSGHE".contains(b)));
 
         if ok && (kind == b'I' || (kind == b'P' && stream_valid)) {
@@ -619,11 +629,11 @@ mod tests {
         assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 9.0.1 (d44f2cf6) DAKEFPVF722")), "ARM, ANGLE, NAVPOSHOLD");
         assert_eq!(mode_names(1 << 23, modes_of("INAV 7.1.2 (4e1e59eb) MATEKF405")), "KILLSWITCH");
         assert_eq!(mode_names(1 << 23, modes_of("INAV 8.0.1 (ae47bcba) OMNIBUSF4V3")), "SURFACE");
-        assert_eq!(mode_names(1 | 1 << 30, modes_of("Rotorflight 4.3.0-RC1 (19d3380) STM32G47")), "ARM, бит 30");
+        assert_eq!(mode_names(1 | 1 << 30, modes_of("Rotorflight 4.3.0-RC1 (19d3380) STM32G47")), "ARM, bit 30");
         // Для неизвестной раскладки названы только общие первые три бита.
-        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 10.0.0 (abcdef) X")), "ARM, ANGLE, бит 9");
-        assert_eq!(mode_names(1 << 5, modes_of("EmuFlight 3.7.0 (1014a9331) KAKUTEF7V15")), "бит 5");
-        assert_eq!(mode_names(0, None), "нет");
+        assert_eq!(mode_names(0b11 | 1 << 9, modes_of("INAV 10.0.0 (abcdef) X")), "ARM, ANGLE, bit 9");
+        assert_eq!(mode_names(1 << 5, modes_of("EmuFlight 3.7.0 (1014a9331) KAKUTEF7V15")), "bit 5");
+        assert_eq!(mode_names(0, None), "—");
     }
 
     /// Повреждённые и оборванные файлы не должны ронять разбор.

@@ -12,9 +12,10 @@ a problem — noise, filters, response, motors. Not an autotuner. Linux and
 Windows, a single executable.
 
 Reads logs from Betaflight (3.x – 2026.x), INAV, EmuFlight and Rotorflight,
-including logs with non-standard fields. The interface is currently in Russian.
+including logs with non-standard fields. The interface is available in English
+and Russian: it follows the system language and can be switched from the top bar.
 
-![Overview](docs/screens/overview.png)
+![Overview](docs/screens/en/overview.png)
 
 ## Run
 
@@ -22,7 +23,7 @@ including logs with non-standard fields. The interface is currently in Russian.
 cargo run --release -- path/to/log.bbl
 ```
 
-You can also drop a log onto the window or use the "Открыть лог…" (Open log) button.
+You can also drop a log onto the window or use the "Open log…" button.
 
 ## What it shows
 
@@ -38,15 +39,15 @@ You can also drop a log onto the window or use the "Открыть лог…" (O
 | Motors | Load, saturation, vibration at each motor's rotation frequency |
 | Settings | Parameters from the log; differences between two logs when comparing |
 
-"Сравнить с…" (Compare with) overlays a second log on the spectrum and the
-response; "Сохранить снимок" (Save snapshot) writes a PNG next to the log.
+"Compare with…" overlays a second log on the spectrum and the response;
+"Save snapshot" writes a PNG next to the log.
 
-![Curves](docs/screens/curves.png)
-![Spectrum](docs/screens/spectrum.png)
-![Noise map](docs/screens/heatmap.png)
-![Spectrogram](docs/screens/spectrogram.jpg)
-![Response](docs/screens/step.png)
-![Motors](docs/screens/motors.png)
+![Curves](docs/screens/en/curves.png)
+![Spectrum](docs/screens/en/spectrum.png)
+![Noise map](docs/screens/en/heatmap.png)
+![Spectrogram](docs/screens/en/spectrogram.jpg)
+![Response](docs/screens/en/step.png)
+![Motors](docs/screens/en/motors.png)
 
 ## Without a window
 
@@ -64,5 +65,3 @@ cargo build --release                                   # Linux
 cargo build --release --target x86_64-pc-windows-gnu    # Windows
 cargo test --release
 ```
-
-Status, plan and known weak spots are in [docs/TRACKER.md](docs/TRACKER.md) (in Russian).

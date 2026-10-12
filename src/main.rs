@@ -1,6 +1,8 @@
 // В готовой сборке под Windows не открывать окно консоли рядом с программой.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use]
+mod i18n;
 mod bbl;
 mod dsp;
 mod tabs;
@@ -14,15 +16,20 @@ use egui_plot::{AxisHints, Line, LineStyle, Plot, PlotImage, PlotPoint, PlotPoin
 const AXES: [&str; 3] = ["Roll", "Pitch", "Yaw"];
 /// Поля с компонентами по осям дрона: `имя[0..2]` = Roll, Pitch, Yaw.
 const AXIS_BASES: [&str; 10] = ["gyroADC", "gyroUnfilt", "setpoint", TRACKING_ERROR, "rcCommand", "axisP", "axisI", "axisD", "axisF", "axisSum"];
-/// Расчётное поле: задание минус гироскоп.
-const TRACKING_ERROR: &str = "ошибка";
+/// Расчётное поле: задание минус гироскоп. Называется по-английски, как и поля лога.
+const TRACKING_ERROR: &str = "error";
 /// Что включено на кривых сразу после загрузки.
 const DEFAULT_CURVES: [&str; 2] = ["gyroADC", "setpoint"];
 /// Сигналы, для которых строится спектр.
 const SPECTRUM_BASES: [&str; 3] = ["gyroUnfilt", "gyroADC", "axisD"];
 /// Ширина поля под подписи оси Y — одинаковая, чтобы графики друг под другом совпадали по X.
 const Y_AXIS_WIDTH: f32 = 56.0;
-const TRIAL_FILTER: &str = "пробный фильтр";
+/// Ключ серии пробного фильтра (по нему выбирается цвет); подпись — [`trial_filter_label`].
+const TRIAL_FILTER: &str = "trial filter";
+
+fn trial_filter_label() -> &'static str {
+    t!("пробный фильтр", "trial filter")
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -37,18 +44,35 @@ enum Tab {
     Settings,
 }
 
-/// Вкладки по порядку: `(вкладка, название, имя для командной строки и файлов снимков)`.
-const TABS: [(Tab, &str, &str); 9] = [
-    (Tab::Overview, "Обзор", "overview"),
-    (Tab::Curves, "Кривые", "curves"),
-    (Tab::Spectrum, "Спектр", "spectrum"),
-    (Tab::Heatmap, "Карта шума", "heatmap"),
-    (Tab::Spectrogram, "Спектрограмма", "spectrogram"),
-    (Tab::Step, "Отклик", "step"),
-    (Tab::Error, "Ошибка", "error"),
-    (Tab::Motors, "Моторы", "motors"),
-    (Tab::Settings, "Настройки", "settings"),
+/// Вкладки по порядку: `(вкладка, название по-русски, по-английски, имя для командной строки и файлов снимков)`.
+const TABS: [(Tab, &str, &str, &str); 9] = [
+    (Tab::Overview, "Обзор", "Overview", "overview"),
+    (Tab::Curves, "Кривые", "Curves", "curves"),
+    (Tab::Spectrum, "Спектр", "Spectrum", "spectrum"),
+    (Tab::Heatmap, "Карта шума", "Noise map", "heatmap"),
+    (Tab::Spectrogram, "Спектрограмма", "Spectrogram", "spectrogram"),
+    (Tab::Step, "Отклик", "Response", "step"),
+    (Tab::Error, "Ошибка", "Error", "error"),
+    (Tab::Motors, "Моторы", "Motors", "motors"),
+    (Tab::Settings, "Настройки", "Settings", "settings"),
 ];
+
+/// Название вкладки на текущем языке.
+fn tab_name(tab: &(Tab, &'static str, &'static str, &'static str)) -> &'static str {
+    if i18n::english() { tab.2 } else { tab.1 }
+}
+
+/// Текст события лога на текущем языке.
+fn event_text(event: &bbl::Event) -> String {
+    match event {
+        bbl::Event::SyncBeep => t!("Сигнал синхронизации", "Sync beep").into(),
+        bbl::Event::InflightAdjustment => t!("Подстройка в полёте", "In-flight adjustment").into(),
+        bbl::Event::LoggingResumed => t!("Запись возобновлена", "Logging resumed").into(),
+        bbl::Event::Disarm(reason) => tf!("Дизарм, причина {}", "Disarm, reason {}", reason),
+        bbl::Event::FlightModes { before, now } => tf!("Режимы полёта: {} → {}", "Flight modes: {} → {}", before, now),
+        bbl::Event::EndOfLog => t!("Конец записи", "End of log").into(),
+    }
+}
 
 /// Как делить отклик на ступеньку на вкладке «Отклик».
 #[derive(Clone, Copy, PartialEq)]
@@ -337,7 +361,7 @@ impl Loaded {
                     }
                     _ => Vec::new(),
                 };
-                out.push(Overlay { label: format!("{k}× оборотов"), points, harmonic: true });
+                out.push(Overlay { label: tf!("{k}× оборотов", "{k}× RPM"), points, harmonic: true });
             }
         }
         // Выше верхней частоты карты линии не рисуются.
@@ -470,7 +494,9 @@ fn row_height(ui: &egui::Ui, count: usize) -> f32 {
 fn new_plot<'a>(id: impl egui::AsId) -> Plot<'a> {
     // Подписи делений по X видны уже при шаге от 50 px, а не только у самых редких линий сетки.
     let x_axis = AxisHints::new_x().label_spacing(egui::Rangef::new(30.0, 50.0));
-    Plot::new(id).custom_x_axes(vec![x_axis]).y_axis_min_width(Y_AXIS_WIDTH).grid_spacing(egui::Rangef::new(16.0, 60.0)).grid_color(theme::MUTED)
+    // По Y наоборот реже: на высоком окне подписи через каждые 10 Гц сливались в столбик.
+    let y_axis = AxisHints::new_y().label_spacing(egui::Rangef::new(45.0, 90.0));
+    Plot::new(id).custom_x_axes(vec![x_axis]).custom_y_axes(vec![y_axis]).y_axis_min_width(Y_AXIS_WIDTH).grid_spacing(egui::Rangef::new(16.0, 60.0)).grid_color(theme::MUTED)
 }
 
 /// Частоты настроенных фильтров из заголовка лога: `(параметр, Гц)`.
@@ -504,15 +530,15 @@ fn line<'a>(name: &str, points: Vec<[f64; 2]>) -> Line<'a> {
 /// Множитель и единица измерения для полей, которые в логе записаны в сотых долях.
 fn unit(name: &str) -> (f64, &'static str) {
     match name {
-        "vbatLatest" => (0.01, ", В"),
-        "amperageLatest" => (0.01, ", А"),
+        "vbatLatest" => (0.01, t!(", В", ", V")),
+        "amperageLatest" => (0.01, t!(", А", ", A")),
         _ => (1.0, ""),
     }
 }
 
 /// «Roll 1.9 мс, Pitch 2.0 мс, Yaw нет данных».
 fn per_axis_ms(values: [Option<f64>; 3]) -> String {
-    let text = |a: usize| values[a].map_or(format!("{} нет данных", AXES[a]), |ms| format!("{} {ms:.1} мс", AXES[a]));
+    let text = |a: usize| values[a].map_or(tf!("{} нет данных", "{} no data", AXES[a]), |ms| tf!("{} {ms:.1} мс", "{} {ms:.1} ms", AXES[a]));
     [text(0), text(1), text(2)].join(", ")
 }
 
@@ -523,9 +549,9 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
     let height = row_height(ui, rows);
     let mut range = loaded.range;
     for row in 0..rows {
-        let mut plot = new_plot(("curves", row)).height(height).link_axis("curves", [true, false]).link_cursor("curves", [true, false]).y_axis_label(AXES.get(row).copied().unwrap_or("Прочее"));
+        let mut plot = new_plot(("curves", row)).height(height).link_axis("curves", [true, false]).link_cursor("curves", [true, false]).y_axis_label(AXES.get(row).copied().unwrap_or(t!("Прочее", "Other")));
         if row == rows - 1 {
-            plot = plot.x_axis_label("время, с");
+            plot = plot.x_axis_label(t!("время, с", "time, s"));
         }
         plot.show(ui, |plot| {
             if loaded.reset_zoom {
@@ -553,7 +579,7 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
                 plot.line(line(&log.names[i], points).name(format!("{}{suffix}", log.names[i])));
             }
             for (time, event) in &log.events {
-                plot.vline(VLine::new(event, *time).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
+                plot.vline(VLine::new(event_text(event), *time).color(theme::MUTED).style(LineStyle::dashed_dense()).width(1.0));
             }
         });
     }
@@ -563,7 +589,7 @@ fn show_curves(ui: &mut egui::Ui, loaded: &mut Loaded) {
 
 fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Loaded>, view: &mut View) {
     let (lo, hi) = loaded.range;
-    let span = format!("Участок {:.2}–{:.2} с. Чтобы выбрать другой, измените масштаб на вкладке «Кривые».", loaded.log.time[lo], loaded.log.time[hi.max(lo + 1) - 1]);
+    let span = tf!("Участок {:.2}–{:.2} с. Чтобы выбрать другой, измените масштаб на вкладке «Кривые».", "Range {:.2}–{:.2} s. To pick another one, zoom on the Curves tab.", loaded.log.time[lo], loaded.log.time[hi.max(lo + 1) - 1]);
     let nyquist = loaded.sample_rate / 2.0;
     let marks: Vec<(String, f64)> = filter_marks(&loaded.log).into_iter().filter(|(_, hz)| *hz < nyquist).collect();
     let delays = loaded.delays();
@@ -579,26 +605,26 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
         }
         if trial.is_some() {
             swatch(ui, TRIAL_FILTER);
-            ui.label(TRIAL_FILTER);
+            ui.label(trial_filter_label());
         }
         ui.separator();
         ui.colored_label(theme::MUTED, span);
     });
     ui.horizontal_wrapped(|ui| {
-        ui.label("Задержка фильтров гироскопа");
-        ui.colored_label(theme::MUTED, if has_raw { per_axis_ms(delays) } else { "нет поля gyroUnfilt в логе".into() });
+        ui.label(t!("Задержка фильтров гироскопа", "Gyro filter delay"));
+        ui.colored_label(theme::MUTED, if has_raw { per_axis_ms(delays) } else { t!("нет поля gyroUnfilt в логе", "no gyroUnfilt field in the log").into() });
         if has_raw {
             ui.separator();
-            ui.checkbox(&mut view.trial_on, "Пробный фильтр на gyroUnfilt");
+            ui.checkbox(&mut view.trial_on, t!("Пробный фильтр на gyroUnfilt", "Trial filter on gyroUnfilt"));
             if view.trial_on {
                 egui::ComboBox::from_id_salt("trial_order").selected_text(format!("PT{}", view.trial_order)).show_ui(ui, |ui| {
                     for order in 1..=3 {
                         ui.selectable_value(&mut view.trial_order, order, format!("PT{order}"));
                     }
                 });
-                ui.add(egui::Slider::new(&mut view.trial_hz, 20..=(nyquist as u32).max(21)).suffix(" Гц"));
+                ui.add(egui::Slider::new(&mut view.trial_hz, 20..=(nyquist as u32).max(21)).suffix(t!(" Гц", " Hz")));
                 if let Some((_, trial_delays)) = &trial {
-                    ui.colored_label(theme::MUTED, format!("задержка с ним: {}", per_axis_ms(*trial_delays)));
+                    ui.colored_label(theme::MUTED, tf!("задержка с ним: {}", "delay with it: {}", per_axis_ms(*trial_delays)));
                 }
             }
         }
@@ -606,19 +632,19 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
 
     let height = row_height(ui, 3);
     for (a, axis) in AXES.iter().enumerate() {
-        let mut plot = new_plot(("spectrum", a)).height(height).link_axis("spectrum", [true, true]).link_cursor("spectrum", [true, false]).y_axis_label(format!("{axis}, дБ"));
+        let mut plot = new_plot(("spectrum", a)).height(height).link_axis("spectrum", [true, true]).link_cursor("spectrum", [true, false]).y_axis_label(tf!("{axis}, дБ", "{axis}, dB"));
         if a == 2 {
-            plot = plot.x_axis_label("частота, Гц");
+            plot = plot.x_axis_label(t!("частота, Гц", "frequency, Hz"));
         }
         plot.show(ui, |plot| {
             for (base, by_axis) in spectra {
                 plot.line(line(base, by_axis[a].clone()));
             }
             if let Some((trial_spectra, _)) = &trial {
-                plot.line(line(TRIAL_FILTER, trial_spectra[a].clone()));
+                plot.line(line(TRIAL_FILTER, trial_spectra[a].clone()).name(trial_filter_label()));
             }
             for (base, by_axis) in compared.into_iter().flatten() {
-                plot.line(line(base, by_axis[a].clone()).name(format!("{base}, сравнение")).style(LineStyle::dashed_loose()));
+                plot.line(line(base, by_axis[a].clone()).name(tf!("{base}, сравнение", "{base}, comparison")).style(LineStyle::dashed_loose()));
             }
             // Подписи идут лесенкой, чтобы соседние частоты не накладывались. Высота
             // берётся от самих спектров, а не от границ графика: иначе подписи раздвигали
@@ -639,7 +665,7 @@ fn show_spectrum(ui: &mut egui::Ui, loaded: &mut Loaded, compare: Option<&mut Lo
 
 /// Шкала цвета карт: полоска палитры с подписями крайних уровней.
 fn colorbar(ui: &mut egui::Ui, top_db: f32, range_db: f32) {
-    ui.colored_label(theme::MUTED, format!("{:.0} дБ", top_db - range_db));
+    ui.colored_label(theme::MUTED, tf!("{:.0} дБ", "{:.0} dB", top_db - range_db));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(160.0, 10.0), egui::Sense::hover());
     let steps = 64;
     for i in 0..steps {
@@ -647,7 +673,7 @@ fn colorbar(ui: &mut egui::Ui, top_db: f32, range_db: f32) {
         let cell = egui::Rect::from_min_max(egui::pos2(x(i), rect.top()), egui::pos2(x(i + 1), rect.bottom()));
         ui.painter().rect_filled(cell, 0.0, theme::colormap(i as f32 / (steps - 1) as f32));
     }
-    ui.colored_label(theme::MUTED, format!("{top_db:.0} дБ"));
+    ui.colored_label(theme::MUTED, tf!("{top_db:.0} дБ", "{top_db:.0} dB"));
 }
 
 /// Подпись под курсором на карте: положение по осям и уровень в ячейке матрицы.
@@ -657,8 +683,8 @@ fn map_readout(grid: Option<&dsp::Grid>, unit: &str, x_max: f64, f_max: f64, x: 
         ((0.0..g.w as f64).contains(&col) && (0.0..g.h as f64).contains(&row)).then(|| g.db[col as usize * g.h + row as usize])
     });
     match level.filter(|db| !db.is_nan()) {
-        Some(db) => format!("{x:.1} {unit}, {hz:.0} Гц: {db:.0} дБ"),
-        None => format!("{x:.1} {unit}, {hz:.0} Гц: нет данных"),
+        Some(db) => tf!("{x:.1} {unit}, {hz:.0} Гц: {db:.0} дБ", "{x:.1} {unit}, {hz:.0} Hz: {db:.0} dB"),
+        None => tf!("{x:.1} {unit}, {hz:.0} Гц: нет данных", "{x:.1} {unit}, {hz:.0} Hz: no data"),
     }
 }
 
@@ -677,35 +703,35 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
         (false, false) => MapKind::Throttle,
     };
     let set = &loaded.maps(ui.ctx(), view.map_signal, view.map_range_db).sets[kind as usize];
-    let x_label = ["газ, %", "время, с", "обороты моторов, Гц"][kind as usize];
+    let x_label = [t!("газ, %", "throttle, %"), t!("время, с", "time, s"), t!("обороты моторов, Гц", "motor speed, Hz")][kind as usize];
     let overlays = view.overlays;
 
     ui.horizontal(|ui| {
         if !spectrogram && has_rpm {
-            ui.selectable_value(&mut view.by_rpm, false, "По газу");
-            ui.selectable_value(&mut view.by_rpm, true, "По оборотам");
+            ui.selectable_value(&mut view.by_rpm, false, t!("По газу", "By throttle"));
+            ui.selectable_value(&mut view.by_rpm, true, t!("По оборотам", "By RPM"));
             ui.separator();
         }
-        ui.label("Сигнал");
+        ui.label(t!("Сигнал", "Signal"));
         egui::ComboBox::from_id_salt("map_signal").selected_text(view.map_signal).show_ui(ui, |ui| {
             for base in bases {
                 ui.selectable_value(&mut view.map_signal, base, base);
             }
         });
         ui.separator();
-        ui.label("Диапазон");
-        ui.add(egui::Slider::new(&mut view.map_range_db, 20.0..=100.0).suffix(" дБ").fixed_decimals(0));
+        ui.label(t!("Диапазон", "Range"));
+        ui.add(egui::Slider::new(&mut view.map_range_db, 20.0..=100.0).suffix(t!(" дБ", " dB")).fixed_decimals(0));
         ui.separator();
         colorbar(ui, set.top_db, view.map_range_db);
         ui.separator();
-        ui.checkbox(&mut view.overlays, "Фильтры и обороты").on_hover_text(
-            "Штриховые линии — частоты среза фильтров из настроек лога: шум выше линии фильтр давит. Пунктирные 1×, 2×, 3× — где лежит шум, кратный оборотам моторов (нужна телеметрия оборотов). Яркая полоса вдоль пунктира — моторы и пропеллеры; полоса на постоянной частоте — резонанс рамы.",
+        ui.checkbox(&mut view.overlays, t!("Фильтры и обороты", "Filters and RPM")).on_hover_text(
+            t!("Штриховые линии — частоты среза фильтров из настроек лога: шум выше линии фильтр давит. Пунктирные 1×, 2×, 3× — где лежит шум, кратный оборотам моторов (нужна телеметрия оборотов). Яркая полоса вдоль пунктира — моторы и пропеллеры; полоса на постоянной частоте — резонанс рамы.", "Dashed lines are filter cutoff frequencies from the log settings: the filter suppresses noise above the line. Dotted 1×, 2×, 3× lines show where noise at multiples of motor speed lies (needs RPM telemetry). A bright band along a dotted line means motors and props; a band at a constant frequency means a frame resonance."),
         );
     });
 
     let plot_axis = |ui: &mut egui::Ui, a: usize, height: f32, with_x_label: bool| {
         let Some(texture) = set.textures.get(a).and_then(Option::as_ref) else {
-            ui.colored_label(theme::MUTED, format!("{}: в логе нет этого сигнала, газа или оборотов", AXES[a]));
+            ui.colored_label(theme::MUTED, tf!("{}: в логе нет этого сигнала, газа или оборотов", "{}: the log has no such signal, throttle or RPM", AXES[a]));
             return;
         };
         let mut plot = new_plot(("map", kind as usize, a))
@@ -714,13 +740,13 @@ fn show_maps(ui: &mut egui::Ui, loaded: &mut Loaded, spectrogram: bool, view: &m
             .link_cursor(egui::Id::new(("map", kind as usize)), [true, true])
             .set_margin_fraction(egui::Vec2::ZERO)
             .show_grid(false)
-            .y_axis_label(format!("{}, Гц", AXES[a]));
+            .y_axis_label(tf!("{}, Гц", "{}, Hz", AXES[a]));
         if with_x_label {
             plot = plot.x_axis_label(x_label);
         }
         // В углу — что под курсором: положение по осям и уровень в этой ячейке.
         let grid = set.grids[a].as_ref();
-        let unit = ["%", "с", "Гц"][kind as usize];
+        let unit = ["%", t!("с", "s"), t!("Гц", "Hz")][kind as usize];
         let readout = move |point: &PlotPoint, _: &egui_plot::PlotBounds| map_readout(grid, unit, set.x_max, f_max, point.x, point.y);
         plot = plot.coordinates_formatter(egui_plot::Corner::RightTop, egui_plot::CoordinatesFormatter::new(readout));
         plot.show(ui, |plot| {
@@ -795,6 +821,8 @@ struct App {
     error: Option<String>,
     /// Сообщение о последнем действии в строке состояния.
     notice: Option<String>,
+    /// Заголовок окна, выставленный последним.
+    title: String,
     tab: Tab,
     view: View,
     /// Режим «снять и выйти»: через сколько кадров сохранить снимок вкладки и закрыть окно.
@@ -803,8 +831,8 @@ struct App {
 
 /// Все логи с данными из файла.
 fn load(path: &Path) -> Result<Vec<Loaded>, String> {
-    let data = std::fs::read(path).map_err(|e| format!("Не удалось прочитать {}: {e}", path.display()))?;
-    let mut errors = vec![format!("В файле {} нет логов с данными", path.display())];
+    let data = std::fs::read(path).map_err(|e| tf!("Не удалось прочитать {}: {e}", "Could not read {}: {e}", path.display()))?;
+    let mut errors = vec![tf!("В файле {} нет логов с данными", "No logs with data in {}", path.display())];
     let logs: Vec<Loaded> = bbl::parse_file(&data).into_iter().filter_map(|l| l.map_err(|e| errors.push(e)).ok()).filter(|l| l.time.len() > 1).map(Loaded::new).collect();
     if logs.is_empty() { Err(errors.join("; ")) } else { Ok(logs) }
 }
@@ -841,13 +869,13 @@ impl App {
 
     /// Сохраняет снимок окна в PNG рядом с логом: `<лог>_<вкладка>.png`.
     fn save_screenshot(&mut self, image: &egui::ColorImage) {
-        let slug = TABS.iter().find(|t| t.0 == self.tab).map_or("", |t| t.2);
+        let slug = TABS.iter().find(|t| t.0 == self.tab).map_or("", |t| t.3);
         let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
         let target = self.path.with_file_name(format!("{stem}_{slug}.png"));
         let saved = image::save_buffer(&target, image.as_raw(), image.width() as u32, image.height() as u32, image::ColorType::Rgba8);
         match saved {
-            Ok(()) => self.notice = Some(format!("Снимок сохранён: {}", target.display())),
-            Err(e) => self.error = Some(format!("Не удалось сохранить снимок в {}: {e}", target.display())),
+            Ok(()) => self.notice = Some(tf!("Снимок сохранён: {}", "Snapshot saved: {}", target.display())),
+            Err(e) => self.error = Some(tf!("Не удалось сохранить снимок в {}: {e}", "Could not save the snapshot to {}: {e}", target.display())),
         }
     }
 }
@@ -861,7 +889,7 @@ impl eframe::App for App {
 impl App {
     fn new() -> Self {
         let view = View { map_signal: "gyroADC", map_range_db: 50.0, by_rpm: false, overlays: true, trial_on: false, trial_order: 1, trial_hz: 100, step_split: StepSplit::None, settings_filter: String::new(), only_different: false };
-        Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, tab: Tab::Overview, view, snapshot_in: None }
+        Self { path: PathBuf::new(), logs: Vec::new(), compare: None, current: 0, error: None, notice: None, title: String::new(), tab: Tab::Overview, view, snapshot_in: None }
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -874,6 +902,12 @@ impl App {
                 _ => None,
             })
         });
+        // Имя открытого лога — в заголовке окна: видно на панели задач и при нескольких окнах.
+        let title = if self.logs.is_empty() { "FPV Log Analyzer".to_string() } else { format!("{} — FPV Log Analyzer", file_name(&self.path)) };
+        if self.title != title {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         if let Some(image) = screenshot {
             self.save_screenshot(&image);
             if self.snapshot_in.is_some() {
@@ -898,35 +932,45 @@ impl App {
             ui.add_space(4.0);
             // С переносом: при выборе записи и в узком окне вкладки уходят на вторую строку, а не за край.
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Открыть лог…").clicked()
+                if ui.button(t!("Открыть лог…", "Open log…")).clicked()
                     && let Some(path) = pick_log()
                 {
                     self.open(&path);
                 }
                 if !self.logs.is_empty() {
                     if self.compare.is_some() {
-                        if ui.button("Убрать сравнение").clicked() {
+                        if ui.button(t!("Убрать сравнение", "Remove comparison")).clicked() {
                             self.compare = None;
                         }
-                    } else if ui.button("Сравнить с…").clicked()
+                    } else if ui.button(t!("Сравнить с…", "Compare with…")).clicked()
                         && let Some(path) = pick_log()
                     {
                         self.open_compare(&path);
                     }
-                    if ui.button("Сохранить снимок").clicked() {
+                    if ui.button(t!("Сохранить снимок", "Save snapshot")).clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
                     }
                 }
                 if self.logs.len() > 1 {
-                    egui::ComboBox::from_id_salt("log").selected_text(format!("Запись {} из {}", self.current + 1, self.logs.len())).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("log").selected_text(tf!("Запись {} из {}", "Record {} of {}", self.current + 1, self.logs.len())).show_ui(ui, |ui| {
                         for (i, l) in self.logs.iter().enumerate() {
-                            ui.selectable_value(&mut self.current, i, format!("Запись {}, {:.0} с", i + 1, l.log.time.last().unwrap_or(&0.0)));
+                            ui.selectable_value(&mut self.current, i, tf!("Запись {}, {:.0} с", "Record {}, {:.0} s", i + 1, l.log.time.last().unwrap_or(&0.0)));
                         }
                     });
                 }
                 ui.separator();
-                for (tab, name, _) in TABS {
-                    ui.selectable_value(&mut self.tab, tab, name);
+                for tab in &TABS {
+                    ui.selectable_value(&mut self.tab, tab.0, tab_name(tab));
+                }
+                ui.separator();
+                // Переключатель языка. Тексты находок и подписи линий посчитаны заранее —
+                // при смене языка они сбрасываются и собираются заново.
+                let english = i18n::english();
+                if ui.selectable_label(false, if english { "Русский" } else { "English" }).on_hover_text(if english { "Переключить интерфейс на русский" } else { "Switch the interface to English" }).clicked() {
+                    i18n::set_english(!english);
+                    for loaded in self.logs.iter_mut().chain(self.compare.iter_mut().map(|(_, c)| c)) {
+                        (loaded.overview, loaded.split_steps, loaded.maps) = (None, None, None);
+                    }
                 }
             });
             ui.add_space(4.0);
@@ -939,18 +983,18 @@ impl App {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 (None, Some(l)) => {
-                    fact(ui, "Лог", file_name(&self.path));
-                    fact(ui, "Прошивка", l.log.header("Firmware revision").unwrap_or("неизвестна").to_string());
-                    fact(ui, "Запись", format!("{:.0} Гц", l.sample_rate));
-                    fact(ui, "Длительность", format!("{:.1} с", l.log.time.last().unwrap_or(&0.0)));
-                    fact(ui, "Разрывов записи", l.log.corrupt.to_string());
+                    fact(ui, t!("Лог", "Log"), file_name(&self.path));
+                    fact(ui, t!("Прошивка", "Firmware"), l.log.header("Firmware revision").unwrap_or(t!("неизвестна", "unknown")).to_string());
+                    fact(ui, t!("Запись", "Rate"), tf!("{:.0} Гц", "{:.0} Hz", l.sample_rate));
+                    fact(ui, t!("Длительность", "Duration"), tf!("{:.1} с", "{:.1} s", l.log.time.last().unwrap_or(&0.0)));
+                    fact(ui, t!("Разрывов записи", "Recording gaps"), l.log.corrupt.to_string());
                     if l.range != (0, l.log.time.len()) {
                         let (lo, hi) = l.range;
-                        fact(ui, "Анализируется участок", format!("{:.2}–{:.2} с", l.log.time[lo], l.log.time[hi.max(lo + 1) - 1]));
-                        whole_log = ui.button("Весь лог").clicked();
+                        fact(ui, t!("Анализируется участок", "Analysing range"), tf!("{:.2}–{:.2} с", "{:.2}–{:.2} s", l.log.time[lo], l.log.time[hi.max(lo + 1) - 1]));
+                        whole_log = ui.button(t!("Весь лог", "Whole log")).clicked();
                     }
                     if let Some((name, _)) = &self.compare {
-                        fact(ui, "Сравнение, штриховые линии", name.clone());
+                        fact(ui, t!("Сравнение, штриховые линии", "Comparison (dashed lines)"), name.clone());
                     }
                     if let Some(notice) = &self.notice {
                         ui.label(notice);
@@ -966,7 +1010,7 @@ impl App {
 
         let Some(loaded) = self.logs.get_mut(self.current) else {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| ui.colored_label(theme::MUTED, "Перетащите сюда файл лога (.bbl) или нажмите «Открыть лог…»"));
+                ui.centered_and_justified(|ui| ui.colored_label(theme::MUTED, t!("Перетащите сюда файл лога (.bbl) или нажмите «Открыть лог…»", "Drop a log file (.bbl) here or click “Open log…”")));
             });
             return;
         };
@@ -974,7 +1018,7 @@ impl App {
         if self.tab == Tab::Curves {
             egui::Panel::left("fields").show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.colored_label(theme::MUTED, "По осям");
+                    ui.colored_label(theme::MUTED, t!("По осям", "Per axis"));
                     for f in &mut loaded.axis_fields {
                         ui.horizontal(|ui| {
                             swatch(ui, f.base);
@@ -982,7 +1026,7 @@ impl App {
                         });
                     }
                     ui.add_space(8.0);
-                    ui.colored_label(theme::MUTED, "Прочее");
+                    ui.colored_label(theme::MUTED, t!("Прочее", "Other"));
                     for (i, on) in &mut loaded.other_fields {
                         ui.horizontal(|ui| {
                             swatch(ui, &loaded.log.names[*i]);
@@ -1060,7 +1104,7 @@ fn main() -> eframe::Result {
         let index = args.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
         match app.logs.get(index.wrapping_sub(1)) {
             Some(loaded) => write_csv(&loaded.log),
-            None => eprintln!("{}", app.error.unwrap_or(format!("В файле нет записи {index}"))),
+            None => eprintln!("{}", app.error.unwrap_or(tf!("В файле нет записи {index}", "The file has no record {index}"))),
         }
         return Ok(());
     }
@@ -1072,12 +1116,13 @@ fn main() -> eframe::Result {
     }
     if mode.as_deref() == Some("report") {
         for (i, loaded) in app.logs.iter_mut().enumerate() {
-            say(format_args!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", i + 1, loaded.log.time.last().unwrap_or(&0.0), loaded.sample_rate, loaded.log.time.len(), loaded.log.corrupt));
+            let (duration, frames) = (*loaded.log.time.last().unwrap_or(&0.0), loaded.log.time.len());
+            say(format_args!("{}", tf!("Запись {}: {:.0} с, {:.0} Гц, кадров {}, разрывов записи {}", "Record {}: {:.0} s, {:.0} Hz, {} frames, {} recording gaps", i + 1, duration, loaded.sample_rate, frames, loaded.log.corrupt)));
             for (important, text) in &tabs::overview(loaded).findings {
-                say(format_args!("  [{}] {text}", if *important { "важно" } else { "заметка" }));
+                say(format_args!("  [{}] {text}", if *important { t!("важно", "important") } else { t!("заметка", "note") }));
             }
             for (time, event) in &loaded.log.events {
-                say(format_args!("  [событие] {time:.2} с: {event}"));
+                say(format_args!("  [{}] {time:.2} {}: {}", t!("событие", "event"), t!("с", "s"), event_text(event)));
             }
         }
         if let Some(e) = &app.error {
@@ -1091,7 +1136,7 @@ fn main() -> eframe::Result {
         Some("trial") => (app.tab, app.view.trial_on) = (Tab::Spectrum, true),
         Some("step-rate") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Rate),
         Some("step-throttle") => (app.tab, app.view.step_split) = (Tab::Step, StepSplit::Throttle),
-        mode => app.tab = TABS.iter().find(|t| Some(t.2) == mode).map_or(app.tab, |t| t.0),
+        mode => app.tab = TABS.iter().find(|t| Some(t.3) == mode).map_or(app.tab, |t| t.0),
     }
     if let Some(path) = args.next() {
         app.open_compare(Path::new(&path));
@@ -1130,6 +1175,7 @@ mod ui_tests {
     use super::*;
 
     fn harness() -> Option<Harness<'static, App>> {
+        i18n::set_english(false); // тесты ищут элементы по русским подписям
         let mut app = App::new();
         app.open(Path::new(&(std::env::var("HOME").unwrap() + "/storage/adrc-8ksal8-goodtune/ADRC_Good_Tune.bbl")));
         if app.logs.is_empty() {
@@ -1145,11 +1191,16 @@ mod ui_tests {
     #[test]
     fn every_tab_opens() {
         let Some(mut harness) = harness() else { return };
-        for (tab, name, _) in TABS {
-            harness.get_by_label(name).click();
-            harness.run_steps(4);
-            assert!(harness.state().tab == tab, "вкладка «{name}» не открылась");
+        for english in [false, true] {
+            i18n::set_english(english);
+            harness.run_steps(2);
+            for tab in &TABS {
+                harness.get_by_label(tab_name(tab)).click();
+                harness.run_steps(4);
+                assert!(harness.state().tab == tab.0, "вкладка «{}» не открылась", tab_name(tab));
+            }
         }
+        i18n::set_english(false);
         // Переключатели внутри вкладок тоже должны отрисовываться без падений.
         harness.state_mut().tab = Tab::Heatmap;
         harness.state_mut().view.by_rpm = true;
@@ -1235,8 +1286,29 @@ mod ui_tests {
         eprintln!("открыто логов: {opened} из {}", paths.len());
     }
 
+    /// Крайние случаи: участок из одного-двух кадров, из горстки кадров и лог для сравнения —
+    /// ни одна вкладка не должна падать.
+    #[test]
+    fn tiny_ranges_and_comparison_do_not_break_tabs() {
+        let Some(mut harness) = harness() else { return };
+        let frames = harness.state().logs[0].log.time.len();
+        let path = harness.state().path.clone();
+        harness.state_mut().open_compare(&path);
+        for range in [(0, 1), (0, 2), (0, 50), (frames - 1, frames), (frames / 2, frames / 2 + 300)] {
+            for split in [StepSplit::None, StepSplit::Rate, StepSplit::Throttle] {
+                for (tab, ..) in TABS.into_iter().filter(|t| t.0 != Tab::Curves) {
+                    let app = harness.state_mut();
+                    (app.tab, app.view.step_split, app.view.trial_on, app.view.by_rpm) = (tab, split, true, true);
+                    app.logs[0].range = range;
+                    harness.run_steps(2);
+                }
+            }
+        }
+    }
+
     #[test]
     fn map_readout_reports_cell_level() {
+        i18n::set_english(false);
         let grid = dsp::Grid { w: 2, h: 3, db: vec![1.0, 2.0, 3.0, f32::NAN, 5.0, 6.0] };
         assert_eq!(map_readout(Some(&grid), "%", 100.0, 500.0, 25.0, 250.0), "25.0 %, 250 Гц: 2 дБ");
         assert_eq!(map_readout(Some(&grid), "%", 100.0, 500.0, 75.0, 10.0), "75.0 %, 10 Гц: нет данных");

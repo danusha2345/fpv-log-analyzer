@@ -9,6 +9,7 @@ egui_plot = "0.37.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 realfft = "3.5.0"
 rfd = "0.17.2"
+sys-locale = "0.3.2"
 
 [profile.release]
 strip = true
