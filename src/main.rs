@@ -237,12 +237,17 @@ impl Loaded {
         Some(self.log.col("rcCommand[3]")?.iter().map(|v| (v - 1000.0) / 10.0).collect())
     }
 
+    /// Множитель из значения поля eRPM в частоту вращения мотора, Гц (об/с).
+    /// В логе eRPM записан в сотнях электрических оборотов в минуту.
+    fn erpm_to_hz(&self) -> f32 {
+        let poles: f32 = self.log.header("motor_poles").and_then(|v| v.trim().parse().ok()).unwrap_or(14.0);
+        100.0 / (poles / 2.0) / 60.0
+    }
+
     /// Средняя по моторам частота вращения, Гц (об/с), из телеметрии eRPM.
     fn motor_hz(&self) -> Option<Vec<f32>> {
         let cols: Vec<&[f32]> = (0..8).filter_map(|i| self.log.col(&format!("eRPM[{i}]"))).collect();
-        let poles: f32 = self.log.header("motor_poles").and_then(|v| v.trim().parse().ok()).unwrap_or(14.0);
-        // В логе eRPM записан в сотнях электрических оборотов в минуту.
-        let to_hz = 100.0 / (poles / 2.0) / 60.0 / cols.len() as f32;
+        let to_hz = self.erpm_to_hz() / cols.len() as f32;
         (!cols.is_empty()).then(|| (0..self.log.time.len()).map(|i| cols.iter().map(|c| c[i]).sum::<f32>() * to_hz).collect())
     }
 

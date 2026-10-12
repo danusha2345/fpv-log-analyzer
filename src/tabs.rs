@@ -100,9 +100,22 @@ pub struct Motors {
     spectra: Vec<Vec<[f64; 2]>>,
     /// Газ: `(средний %, 95 % времени не выше, %)`.
     throttle: Option<(f32, f32)>,
+    /// По моторам (в том же порядке, что `stats`): средние обороты, Гц, и вибрация
+    /// гироскопа на частоте вращения по осям. `None` — в логе нет оборотов этого мотора.
+    rotation: Vec<Option<(f32, [Option<dsp::RotationVibration>; 3])>>,
+    /// Вибрация считалась по сырому гироскопу; иначе — по отфильтрованному, и она занижена.
+    rotation_from_raw: bool,
 }
 
 impl Motors {
+    /// Вибрация мотора в плоскости рамы: Roll и Pitch вместе (на Yaw дисбаланс почти не действует).
+    /// Вторым числом — фон, с которым её надо сравнивать.
+    fn shake(&self, motor: usize) -> Option<(f64, f64)> {
+        let (_, by_axis) = self.rotation.get(motor)?.as_ref()?;
+        let (roll, pitch) = (by_axis[0].as_ref()?, by_axis[1].as_ref()?);
+        Some((roll.amplitude.hypot(pitch.amplitude), roll.floor.hypot(pitch.floor)))
+    }
+
     fn new(loaded: &Loaded) -> Self {
         let (lo, hi) = loaded.range;
         let cols: Vec<(&String, &[f32])> = loaded.log.names.iter().zip(&loaded.log.cols).filter(|(n, _)| n.starts_with("motor[")).map(|(n, c)| (n, &c[lo..hi])).collect();
@@ -125,7 +138,18 @@ impl Motors {
             let k = t.len() * 95 / 100;
             (mean, *t.select_nth_unstable_by(k, f32::total_cmp).1)
         });
-        Self { stats, spectra: cols.iter().map(|(_, c)| dsp::welch_db(c, loaded.sample_rate)).collect(), throttle }
+        let rotation_from_raw = loaded.axis_fields.iter().any(|f| f.base == "gyroUnfilt");
+        let gyro = loaded.axis_cols(if rotation_from_raw { "gyroUnfilt" } else { "gyroADC" });
+        let rotation = cols
+            .iter()
+            .map(|(name, _)| {
+                // motor[3] ↔ eRPM[3]
+                let hz: Vec<f32> = loaded.log.col(&name.replace("motor", "eRPM"))?[lo..hi].iter().map(|v| v * loaded.erpm_to_hz()).collect();
+                let mean = hz.iter().sum::<f32>() / hz.len().max(1) as f32;
+                Some((mean, [0, 1, 2].map(|a| dsp::rotation_vibration(&gyro[a]?[lo..hi], &hz, loaded.sample_rate))))
+            })
+            .collect();
+        Self { stats, spectra: cols.iter().map(|(_, c)| dsp::welch_db(c, loaded.sample_rate)).collect(), throttle, rotation, rotation_from_raw }
     }
 }
 
@@ -143,20 +167,41 @@ pub fn show_motors(ui: &mut egui::Ui, loaded: &mut Loaded) {
         ui.colored_label(theme::MUTED, "В логе нет полей motor[…]");
         return;
     }
-    egui::Grid::new("motor_stats").num_columns(5).spacing([24.0, 6.0]).show(ui, |ui| {
+    let has_rotation = motors.rotation.iter().any(Option::is_some);
+    egui::Grid::new("motor_stats").num_columns(9).spacing([24.0, 6.0]).show(ui, |ui| {
         for title in ["", "Мотор", "Средний выход", "На максимуме", "На минимуме"] {
             ui.colored_label(theme::MUTED, title);
         }
+        if has_rotation {
+            for title in ["Обороты", "Вибрация Roll", "Вибрация Pitch", "Вибрация Yaw"] {
+                ui.colored_label(theme::MUTED, title);
+            }
+        }
         ui.end_row();
-        for (name, mean, at_max, at_min) in &motors.stats {
+        for ((name, mean, at_max, at_min), rotation) in motors.stats.iter().zip(&motors.rotation) {
             swatch(ui, name);
             ui.label(name);
             ui.label(format!("{mean:.1} %"));
             ui.label(format!("{at_max:.2} % времени"));
             ui.label(format!("{at_min:.2} % времени"));
+            if let Some((hz, by_axis)) = rotation {
+                ui.label(format!("{hz:.0} Гц"));
+                for vibration in by_axis {
+                    match vibration {
+                        // Вибрация, не превышающая фон вдвое, показана приглушённо: мотор в ней не виден.
+                        Some(v) if v.amplitude > 2.0 * v.floor => ui.label(format!("{:.1} °/с", v.amplitude)),
+                        Some(v) => ui.colored_label(theme::MUTED, format!("{:.1} °/с", v.amplitude)),
+                        None => ui.colored_label(theme::MUTED, "нет данных"),
+                    };
+                }
+            }
             ui.end_row();
         }
     });
+    if has_rotation {
+        let source = if motors.rotation_from_raw { "по сырому гироскопу" } else { "по отфильтрованному гироскопу — RPM-фильтр эту частоту давит, значения занижены" };
+        ui.colored_label(theme::MUTED, format!("Вибрация — амплитуда колебаний гироскопа на частоте вращения мотора, {source}. Приглушённые значения не отличаются от фона."));
+    }
     if let Some((mean, p95)) = motors.throttle {
         ui.horizontal(|ui| {
             ui.label("Газ");
@@ -311,6 +356,23 @@ fn findings(loaded: &mut Loaded, prop_wash: &[Option<dsp::PropWash>; 3]) -> Vec<
             if (mean - mean_all).abs() > 8.0 {
                 let how = if *mean > mean_all { "нагружен сильнее" } else { "нагружен слабее" };
                 out.push((false, format!("{name} {how} остальных: средний выход {mean:.0} % при среднем по моторам {mean_all:.0} %. Проверьте центровку, пропеллер и мотор.")));
+            }
+        }
+    }
+
+    // Мотор, который трясёт заметно сильнее остальных.
+    let motors = &loaded.motors.as_ref().unwrap().1;
+    let shakes: Vec<Option<(f64, f64)>> = (0..motors.stats.len()).map(|m| motors.shake(m)).collect();
+    if shakes.iter().flatten().count() >= 3 {
+        for (m, (shake, floor)) in shakes.iter().enumerate().filter_map(|(m, s)| Some((m, (*s)?))) {
+            let mut others: Vec<f64> = shakes.iter().enumerate().filter(|(i, _)| *i != m).filter_map(|(_, s)| Some((*s)?.0)).collect();
+            let mid = others.len() / 2;
+            let typical = *others.select_nth_unstable_by(mid, f64::total_cmp).1;
+            // Пороги с запасом: разница вдвое встречается и у исправных моторов,
+            // а вибрация слабее 3 °/с на управление не влияет.
+            if shake > 2.5 * typical && shake > 2.0 * floor && shake > 3.0 {
+                let caveat = if motors.rotation_from_raw { "" } else { " Оценка сделана по отфильтрованному гироскопу и занижена." };
+                out.push((shake > 4.0 * typical, format!("{}: вибрация на частоте его вращения {shake:.1} °/с — в {:.1} раза больше, чем у остальных моторов. Проверьте пропеллер, вал и подшипники этого мотора.{caveat}", motors.stats[m].0, shake / typical)));
             }
         }
     }

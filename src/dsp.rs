@@ -374,6 +374,48 @@ pub fn delay_ms(raw: &[f32], filtered: &[f32], fs: f64) -> Option<f64> {
     (den > 0.0).then(|| (-num / (std::f64::consts::TAU * den) * 1000.0).max(0.0))
 }
 
+/// Вибрация гироскопа, синхронная с вращением одного мотора.
+pub struct RotationVibration {
+    /// Амплитуда составляющей на частоте вращения мотора, в единицах сигнала (°/с).
+    pub amplitude: f64,
+    /// То же на частоте в полтора раза выше (между первой и второй гармониками,
+    /// в стороне от оборотов остальных моторов), — уровень фона
+    /// для сравнения: амплитуда около фона значит, что вибрации от мотора не видно.
+    pub floor: f64,
+}
+
+/// Выделяет из `signal` составляющую, которая вращается вместе с мотором
+/// (синхронное детектирование): сигнал умножается на синус и косинус фазы
+/// вращения, накопленной из `motor_hz`, и усредняется по отрезкам в 0.25 с.
+/// Моторы различаются, пока их обороты отличаются хотя бы на несколько герц.
+pub fn rotation_vibration(signal: &[f32], motor_hz: &[f32], fs: f64) -> Option<RotationVibration> {
+    const MIN_HZ: f32 = 20.0; // мотор стоит или еле крутится — отрезок не учитывается
+    let window = (fs * 0.25) as usize;
+    let len = signal.len().min(motor_hz.len());
+    if window < 16 || len < window * 20 {
+        return None;
+    }
+    // Амплитуда составляющей с фазой `ratio`·(фаза вращения) по каждому отрезку.
+    let detect = |ratio: f64| {
+        let (mut phase, mut squares, mut segments) = (0f64, 0f64, 0usize);
+        for (x, hz) in signal[..len].chunks_exact(window).zip(motor_hz[..len].chunks_exact(window)) {
+            let mean = x.iter().sum::<f32>() / window as f32;
+            let (mut cos_sum, mut sin_sum) = (0f64, 0f64);
+            for (v, f) in x.iter().zip(hz) {
+                phase += std::f64::consts::TAU * ratio * *f as f64 / fs;
+                cos_sum += (v - mean) as f64 * phase.cos();
+                sin_sum += (v - mean) as f64 * phase.sin();
+            }
+            if hz.iter().all(|f| *f >= MIN_HZ) {
+                squares += 4.0 * (cos_sum * cos_sum + sin_sum * sin_sum) / (window * window) as f64;
+                segments += 1;
+            }
+        }
+        (segments >= 10).then(|| (squares / segments as f64).sqrt())
+    };
+    Some(RotationVibration { amplitude: detect(1.0)?, floor: detect(1.5)? })
+}
+
 /// Раскачка после сбросов газа (prop wash) по одной оси.
 pub struct PropWash {
     /// Сколько сбросов газа найдено.
@@ -561,6 +603,32 @@ mod tests {
         let settled = r.points.iter().filter(|p| p[0] > 300.0).map(|p| p[1]).sum::<f64>() / r.points.iter().filter(|p| p[0] > 300.0).count() as f64;
         eprintln!("пик {peak:.3} на {peak_ms:.0} мс, установившееся {settled:.3}");
         assert!((peak - 1.37).abs() < 0.05 && (peak_ms - 26.0).abs() < 4.0 && (settled - 1.0).abs() < 0.03, "пик {peak} на {peak_ms} мс, установившееся {settled}");
+    }
+
+    #[test]
+    fn rotation_vibration_singles_out_the_unbalanced_motor() {
+        // Четыре мотора с немного разными и плывущими оборотами; третий трясёт впятеро сильнее.
+        let fs = 2000.0;
+        let amplitudes = [2.0, 2.0, 10.0, 2.0];
+        let mut hz = vec![Vec::new(); 4];
+        let (mut phases, mut gyro) = ([0f64; 4], noise(60_000));
+        for (i, sample) in gyro.iter_mut().enumerate() {
+            let t = i as f64 / fs;
+            for m in 0..4 {
+                let f = 150.0 + 8.0 * m as f64 + 20.0 * (std::f64::consts::TAU * t / 7.0).sin();
+                phases[m] += std::f64::consts::TAU * f / fs;
+                hz[m].push(f as f32);
+                *sample += (amplitudes[m] * phases[m].sin()) as f32;
+            }
+        }
+        for m in 0..4 {
+            let found = rotation_vibration(&gyro, &hz[m], fs).unwrap();
+            let expected = amplitudes[m];
+            assert!((found.amplitude - expected).abs() < expected * 0.25 + 0.5, "мотор {m}: {} вместо {expected}", found.amplitude);
+            assert!(found.floor < 0.6, "фон {}", found.floor);
+        }
+        // Остановленный мотор не оценивается.
+        assert!(rotation_vibration(&gyro, &vec![0.0; gyro.len()], fs).is_none());
     }
 
     #[test]
